@@ -41,9 +41,13 @@ uv run ruff check .                      # lint
 uv run python -m llm_reward.train --config configs/lstm_baseline.yaml
 uv run python -m llm_reward.train --config configs/small_sft_head.yaml
 uv run python -m llm_reward.train --config configs/medium_lora.yaml
-# submit.py doesn't exist yet (deferred, per the spec's stated non-goals) -- this is the
-# planned invocation once it's built, not a command you can run today:
-#   uv run python -m llm_reward.submit --config configs/<same-config> --checkpoint <path>
+
+# one-time (or re-run to refresh): download the competition CSVs into data/raw/
+uv run python scripts/download_data.py
+
+# generate submission.csv from a trained checkpoint -- reads the variant straight out of
+# checkpoint.config, so only --checkpoint is needed (no separate --config to keep in sync)
+uv run python -m llm_reward.submit --checkpoint outputs/lstm_baseline/best.pt
 
 # opt-in, after reviewing a run's metrics: push that checkpoint to the HF Hub
 uv run python scripts/push_to_hub.py --checkpoint outputs/lstm_baseline/best.pt \
@@ -85,24 +89,40 @@ src/llm_reward/
     lora_head.py    # medium HF model + peft LoRA + classification head
   train.py          # single entrypoint for all variants: load config -> registry.build_model -> fit
   evaluate.py
+  submit.py         # checkpoint -> registry.build_model -> run over test.csv -> submission.csv;
+                    # variant comes from checkpoint.config, so no separate --config flag needed
 configs/
   lstm_baseline.yaml
   small_sft_head.yaml
   medium_lora.yaml
 scripts/
+  download_data.py  # thin CLI: download_competition_data() -> copy train/test/sample_submission
+                    # CSVs into data/raw/, the local path train.py/submit.py default to
   push_to_hub.py    # opt-in: push a reviewed checkpoint's weights (+ tokenizer, + model card) to
                     # the HF Hub — the durable store, since /workspace doesn't survive pod deletion
 ```
 
-Not built yet, deliberately (see the spec's stated non-goals): `submit.py` (writes
-`submission.csv` — needs a training loop to exist first, which it now does, but its own
-prediction-path design is a separate follow-up), `scripts/download_data.py`, and
-`scripts/runpod_train.sh`. Don't assume these exist — check before referencing them.
+Not built yet, deliberately (see the spec's stated non-goals): `scripts/runpod_train.sh`. Don't
+assume it exists — check before referencing it.
 
-**Model registry is the DRY seam.** `train.py` and `evaluate.py` are variant-agnostic today
-(`submit.py`, when it's built, is designed to be too); adding a fourth model idea means adding one
-`models/*.py` + one registry entry + one YAML config, never touching the data pipeline or the
-other two variants.
+**Model registry is the DRY seam.** `train.py`, `evaluate.py`, and `submit.py` are all
+variant-agnostic; adding a fourth model idea means adding one `models/*.py` + one registry entry
++ one YAML config, never touching the data pipeline or the other two variants.
+
+**`submit.py`'s id-order contract.** `test.csv`'s row order matched `sample_submission.csv`'s in
+the one archive probed so far, but `submit.py` asserts this rather than assuming it: it reorders
+predictions to `sample_submission.csv`'s id order and raises if the id sets don't match exactly.
+It also outputs class **probabilities** (softmax over the 3 logits), not hard labels — the real
+`sample_submission.csv` columns are `id,winner_model_a,winner_model_b,winner_tie` (note:
+`winner_tie`, not `winner_model_tie` — that's train.csv's label-column name, not the submission
+column name).
+
+**Test-time examples use a sentinel label.** `test.csv` has no ground truth, but
+`PairwiseExample.label` is a mandatory int consumed by every collate_fn. `load_test_examples`
+(in `data/pairwise.py`) sets `label=-1` on every row rather than introducing a second,
+parallel "unlabeled" type + collate_fn per variant; `-1` is documented on the field and accepted
+by `PairwiseExample.__post_init__`. `submit.py` never reads the `labels` tensor this produces —
+it drops that key from the batch before the forward pass.
 
 **RunPod workflow is manual, not scripted.** You provision/start/stop the pod yourself (RunPod
 CLI/MCP or console); this repo only needs to run cleanly over SSH once `uv sync` has been run on the

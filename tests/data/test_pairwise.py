@@ -10,10 +10,15 @@ def test_construct_valid_example():
     assert example.id == "1"
 
 
-@pytest.mark.parametrize("bad_label", [-1, 3, 99])
+@pytest.mark.parametrize("bad_label", [3, 99, -2])
 def test_rejects_out_of_range_label(bad_label):
     with pytest.raises(CheckFailed, match="label must be"):
         PairwiseExample(id="1", prompt="p", response_a="a", response_b="b", label=bad_label)
+
+
+def test_accepts_sentinel_label_for_unlabeled_test_time_examples():
+    example = PairwiseExample(id="1", prompt="p", response_a="a", response_b="b", label=-1)
+    assert example.label == -1
 
 
 def test_rejects_empty_id():

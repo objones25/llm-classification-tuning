@@ -1,0 +1,4 @@
+id,prompt,response_a,response_b
+101,"What is 2+2?","4","Four"
+102,"['Say hi', 'again']","['hi', 'hi again']","['hello', 'hello again']"
+103,"Pick a number","7","7"

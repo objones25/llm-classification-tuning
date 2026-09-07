@@ -15,10 +15,10 @@ class PairwiseExample:
     prompt: str
     response_a: str
     response_b: str
-    label: int  # 0=a, 1=b, 2=tie
+    label: int  # 0=a, 1=b, 2=tie, -1=unknown (test-time, no ground truth)
 
     def __post_init__(self) -> None:
-        require(self.label in (0, 1, 2), f"label must be 0, 1, or 2; got {self.label!r}")
+        require(self.label in (0, 1, 2, -1), f"label must be 0, 1, 2, or -1; got {self.label!r}")
         require(self.id, "id must not be empty")
 
 
@@ -52,6 +52,27 @@ def load_pairwise_examples(csv_path: Path) -> list[PairwiseExample]:
                     response_a=_extract_text(row["response_a"]),
                     response_b=_extract_text(row["response_b"]),
                     label=label,
+                )
+            )
+    require(len(examples) > 0, f"no rows parsed from {csv_path}")
+    return examples
+
+
+def load_test_examples(csv_path: Path) -> list[PairwiseExample]:
+    """Load a Kaggle test.csv: same prompt/response schema as train.csv, but no winner columns
+    -- there is no ground truth to leak. Every example gets label=-1 (see PairwiseExample)."""
+    require(csv_path.exists(), f"csv file not found: {csv_path}")
+    examples: list[PairwiseExample] = []
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in bounded(reader, limit=1_000_000, name="csv rows"):
+            examples.append(
+                PairwiseExample(
+                    id=row["id"],
+                    prompt=_extract_text(row["prompt"]),
+                    response_a=_extract_text(row["response_a"]),
+                    response_b=_extract_text(row["response_b"]),
+                    label=-1,
                 )
             )
     require(len(examples) > 0, f"no rows parsed from {csv_path}")
