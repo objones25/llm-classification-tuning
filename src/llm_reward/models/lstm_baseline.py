@@ -7,15 +7,9 @@ from torch import nn
 
 from ..data.pairwise import PairwiseExample
 from ..negative_space import require
+from ._common import format_input
 from .config import LSTMConfig
 from .registry import ModelBundle, register
-
-
-def _format_input(example: PairwiseExample) -> str:
-    return (
-        f"{example.prompt}\n[RESPONSE A]\n{example.response_a}"
-        f"\n[RESPONSE B]\n{example.response_b}"
-    )
 
 
 def _hash_tokenize(text: str, vocab_size: int, max_seq_len: int) -> list[int]:
@@ -35,7 +29,7 @@ def make_collate_fn(vocab_size: int, max_seq_len: int):
     def collate_fn(batch: list[PairwiseExample]) -> dict[str, torch.Tensor]:
         require(len(batch) > 0, "collate_fn received an empty batch")
         token_ids = torch.tensor(
-            [_hash_tokenize(_format_input(ex), vocab_size, max_seq_len) for ex in batch],
+            [_hash_tokenize(format_input(ex), vocab_size, max_seq_len) for ex in batch],
             dtype=torch.long,
         )
         labels = torch.tensor([ex.label for ex in batch], dtype=torch.long)

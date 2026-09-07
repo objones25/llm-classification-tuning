@@ -1,49 +1,11 @@
 from __future__ import annotations
 
-import torch
-from torch import nn
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-from ..data.pairwise import PairwiseExample
 from ..negative_space import require
+from ._hf_common import LogitsOnly, make_hf_collate_fn
 from .config import SFTHeadConfig
 from .registry import ModelBundle, register
-
-
-def _format_input(example: PairwiseExample) -> str:
-    return (
-        f"{example.prompt}\n[RESPONSE A]\n{example.response_a}"
-        f"\n[RESPONSE B]\n{example.response_b}"
-    )
-
-
-class _LogitsOnly(nn.Module):
-    """Unwraps a HF ModelOutput so forward(**inputs) returns a bare logits tensor, matching the
-    ModelBundle contract instead of transformers' wrapper object."""
-
-    def __init__(self, hf_model: nn.Module) -> None:
-        super().__init__()
-        self.hf_model = hf_model
-
-    def forward(self, **inputs: torch.Tensor) -> torch.Tensor:
-        return self.hf_model(**inputs).logits
-
-
-def make_collate_fn(tokenizer, max_seq_len: int):
-    def collate_fn(batch: list[PairwiseExample]) -> dict[str, torch.Tensor]:
-        require(len(batch) > 0, "collate_fn received an empty batch")
-        texts = [_format_input(ex) for ex in batch]
-        encoded = tokenizer(
-            texts, padding=True, truncation=True, max_length=max_seq_len, return_tensors="pt"
-        )
-        labels = torch.tensor([ex.label for ex in batch], dtype=torch.long)
-        return {
-            "input_ids": encoded["input_ids"],
-            "attention_mask": encoded["attention_mask"],
-            "labels": labels,
-        }
-
-    return collate_fn
 
 
 @register(SFTHeadConfig.variant)
@@ -76,6 +38,10 @@ def build_model(config: SFTHeadConfig) -> ModelBundle:
             p for n, p in hf_model.named_parameters()
             if p.requires_grad and n.startswith("score")
         ]
+        require(
+            len(head_params) > 0,
+            "no head parameters found -- check the model architecture's classification head naming",
+        )
         backbone_params = [
             p for n, p in hf_model.named_parameters()
             if p.requires_grad and not n.startswith("score")
@@ -86,7 +52,7 @@ def build_model(config: SFTHeadConfig) -> ModelBundle:
         ]
 
     return ModelBundle(
-        model=_LogitsOnly(hf_model),
-        collate_fn=make_collate_fn(tokenizer, config.max_seq_len),
+        model=LogitsOnly(hf_model),
+        collate_fn=make_hf_collate_fn(tokenizer, config.max_seq_len),
         param_groups=param_groups,
     )

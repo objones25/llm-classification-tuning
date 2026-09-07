@@ -34,7 +34,9 @@ def _config(tmp_path, **overrides) -> LoRAConfig:
 
 
 def test_build_model_returns_working_bundle(tmp_path, monkeypatch):
-    monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+    monkeypatch.setattr(
+        lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model
+    )
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
 
     bundle = lora_head.build_model(_config(tmp_path))
@@ -49,7 +51,9 @@ def test_build_model_returns_working_bundle(tmp_path, monkeypatch):
 
 
 def test_backbone_is_frozen_except_lora_and_head(tmp_path, monkeypatch):
-    monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+    monkeypatch.setattr(
+        lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model
+    )
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
 
     bundle = lora_head.build_model(_config(tmp_path))
@@ -59,7 +63,9 @@ def test_backbone_is_frozen_except_lora_and_head(tmp_path, monkeypatch):
 
 
 def test_one_training_step_lowers_loss(tmp_path, monkeypatch):
-    monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+    monkeypatch.setattr(
+        lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model
+    )
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
 
     bundle = lora_head.build_model(_config(tmp_path, lr=1e-2))
@@ -83,7 +89,9 @@ def test_one_training_step_lowers_loss(tmp_path, monkeypatch):
 
 
 def test_head_lr_splits_adapter_and_head_into_two_groups(tmp_path, monkeypatch):
-    monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+    monkeypatch.setattr(
+        lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model
+    )
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
 
     bundle = lora_head.build_model(_config(tmp_path, head_lr=1e-2))
@@ -92,8 +100,12 @@ def test_head_lr_splits_adapter_and_head_into_two_groups(tmp_path, monkeypatch):
     assert bundle.param_groups[1]["lr"] == 1e-2
 
 
-def test_real_model_is_reachable_through_the_wrapper_for_push_to_hub_dispatch(tmp_path, monkeypatch):
-    monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+def test_real_model_is_reachable_through_the_wrapper_for_push_to_hub_dispatch(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model
+    )
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
 
     bundle = lora_head.build_model(_config(tmp_path))
@@ -103,7 +115,9 @@ def test_real_model_is_reachable_through_the_wrapper_for_push_to_hub_dispatch(tm
 
 
 def test_gradient_checkpointing_enables_input_require_grads(tmp_path, monkeypatch):
-    monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+    monkeypatch.setattr(
+        lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model
+    )
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
 
     bundle = lora_head.build_model(_config(tmp_path, gradient_checkpointing=True))
