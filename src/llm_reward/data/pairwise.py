@@ -8,6 +8,27 @@ from pathlib import Path
 
 from ..negative_space import bounded, require
 
+# The real train.csv/test.csv have this asymmetric naming: only the tie column lacks the
+# _model_ infix the other two winner columns carry (verified against the downloaded competition
+# archive -- an earlier assumption of `winner_model_tie` crashed on the real data).
+TRAIN_COLUMNS = {
+    "id", "model_a", "model_b", "prompt", "response_a", "response_b",
+    "winner_model_a", "winner_model_b", "winner_tie",
+}
+TEST_COLUMNS = {"id", "prompt", "response_a", "response_b"}
+
+
+def require_csv_header(csv_path: Path, expected_columns: set[str]) -> None:
+    """Fail fast with a readable message if csv_path's header doesn't match expected_columns,
+    rather than letting a later row[...] access raise a bare KeyError deep in a parsing loop."""
+    require(csv_path.exists(), f"csv file not found: {csv_path}")
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        header = set(next(csv.reader(f), []))
+    require(
+        header == expected_columns,
+        f"{csv_path}: expected columns {sorted(expected_columns)}, got {sorted(header)}",
+    )
+
 
 @dataclass(frozen=True)
 class PairwiseExample:
@@ -33,7 +54,7 @@ def _extract_text(value: str) -> str:
 
 
 def load_pairwise_examples(csv_path: Path) -> list[PairwiseExample]:
-    require(csv_path.exists(), f"csv file not found: {csv_path}")
+    require_csv_header(csv_path, TRAIN_COLUMNS)
     examples: list[PairwiseExample] = []
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -61,7 +82,7 @@ def load_pairwise_examples(csv_path: Path) -> list[PairwiseExample]:
 def load_test_examples(csv_path: Path) -> list[PairwiseExample]:
     """Load a Kaggle test.csv: same prompt/response schema as train.csv, but no winner columns
     -- there is no ground truth to leak. Every example gets label=-1 (see PairwiseExample)."""
-    require(csv_path.exists(), f"csv file not found: {csv_path}")
+    require_csv_header(csv_path, TEST_COLUMNS)
     examples: list[PairwiseExample] = []
     with csv_path.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)

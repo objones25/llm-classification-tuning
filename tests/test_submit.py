@@ -104,6 +104,17 @@ def test_generate_submission_raises_on_id_mismatch(tmp_path):
         )
 
 
+def test_generate_submission_raises_on_bad_sample_submission_header(tmp_path):
+    checkpoint_path = _write_checkpoint(tmp_path)
+    bad_sample_submission = tmp_path / "sample_submission.csv"
+    bad_sample_submission.write_text("id,winner_model_a\n101,1.0\n")
+
+    with pytest.raises(CheckFailed, match="expected columns"):
+        generate_submission(
+            checkpoint_path, TEST_CSV, bad_sample_submission, tmp_path / "submission.csv"
+        )
+
+
 def test_generate_submission_raises_on_missing_checkpoint(tmp_path):
     with pytest.raises(CheckFailed, match="not found"):
         generate_submission(

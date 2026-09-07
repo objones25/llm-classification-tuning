@@ -125,6 +125,16 @@ parallel "unlabeled" type + collate_fn per variant; `-1` is documented on the fi
 by `PairwiseExample.__post_init__`. `submit.py` never reads the `labels` tensor this produces —
 it drops that key from the batch before the forward pass.
 
+**Every CSV's header is validated before its rows are.** `data/pairwise.py`'s
+`require_csv_header(csv_path, expected_columns)` is the one shared check: `load_pairwise_examples`
+validates against `TRAIN_COLUMNS`, `load_test_examples` against `TEST_COLUMNS`, and `submit.py`
+against `{"id", *SUBMISSION_COLUMNS}` — all three raise a clear `CheckFailed` naming the mismatch
+instead of a bare `KeyError` from a `row[...]` access deep in a parsing loop (a real crash on the
+first RunPod run, before this check existed, over the `winner_tie`/`winner_model_tie` asymmetry
+noted above). `scripts/download_data.py` runs the same check on all three files after download,
+before copying them into `data/raw/` — so a schema change on Kaggle's end is caught at download
+time, not partway through a training run.
+
 **RunPod workflow is manual, not scripted.** You provision/start/stop the pod yourself (RunPod
 CLI/MCP or console) and run `scripts/runpod_train.sh <config.yaml>` over SSH once `uv sync` can
 reach the pod; the script itself refuses to do anything unless the checkout is under

@@ -27,6 +27,13 @@ def test_load_pairwise_examples_raises_on_missing_file(tmp_path):
         load_pairwise_examples(tmp_path / "does_not_exist.csv")
 
 
+def test_load_pairwise_examples_raises_on_wrong_header(tmp_path):
+    bad_csv = tmp_path / "bad_train.csv"
+    bad_csv.write_text("id,prompt,response_a,response_b,winner_model_a,winner_model_b\n")
+    with pytest.raises(CheckFailed, match="expected columns"):
+        load_pairwise_examples(bad_csv)
+
+
 def test_split_train_val_is_disjoint_and_covers_everything():
     examples = load_pairwise_examples(FIXTURE) * 4  # 12 examples, still 3 unique-content rows
     examples = [
@@ -61,6 +68,13 @@ def test_load_test_examples_joins_list_encoded_turns():
 def test_load_test_examples_raises_on_missing_file(tmp_path):
     with pytest.raises(CheckFailed, match="not found"):
         load_test_examples(tmp_path / "does_not_exist.csv")
+
+
+def test_load_test_examples_raises_on_wrong_header(tmp_path):
+    bad_csv = tmp_path / "bad_test.csv"
+    bad_csv.write_text("id,prompt\n")
+    with pytest.raises(CheckFailed, match="expected columns"):
+        load_test_examples(bad_csv)
 
 
 def test_split_train_val_rejects_out_of_range_fraction():

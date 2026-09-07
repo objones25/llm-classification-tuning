@@ -9,25 +9,19 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data.dataset import PairwiseDataset
-from .data.pairwise import load_test_examples
+from .data.pairwise import load_test_examples, require_csv_header
 from .models.checkpoint import Checkpoint, ConfigMismatchError
 from .models.config import ConfigError
 from .models.registry import build_model
 from .negative_space import require
 
-_SUBMISSION_COLUMNS = ("winner_model_a", "winner_model_b", "winner_tie")
+SUBMISSION_COLUMNS = ("winner_model_a", "winner_model_b", "winner_tie")
 
 
 def _read_submission_ids(sample_submission_csv: Path) -> list[str]:
-    require(sample_submission_csv.exists(), f"file not found: {sample_submission_csv}")
+    require_csv_header(sample_submission_csv, {"id", *SUBMISSION_COLUMNS})
     with sample_submission_csv.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        expected = {"id", *_SUBMISSION_COLUMNS}
-        require(
-            reader.fieldnames is not None and set(reader.fieldnames) == expected,
-            f"{sample_submission_csv}: expected columns id,{','.join(_SUBMISSION_COLUMNS)}, "
-            f"got {reader.fieldnames}",
-        )
         return [row["id"] for row in reader]
 
 
@@ -82,7 +76,7 @@ def generate_submission(
     output_csv.parent.mkdir(parents=True, exist_ok=True)
     with output_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(("id", *_SUBMISSION_COLUMNS))
+        writer.writerow(("id", *SUBMISSION_COLUMNS))
         for example, prob in zip(ordered_examples, rows, strict=True):
             writer.writerow((example.id, *prob))
 
