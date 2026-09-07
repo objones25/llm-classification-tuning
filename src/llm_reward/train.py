@@ -1,20 +1,23 @@
 from __future__ import annotations
 
+import argparse
 import dataclasses
 from pathlib import Path
 
 import torch
 import wandb
+from dotenv import load_dotenv
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import get_scheduler
 
 from .data.dataset import PairwiseDataset
+from .data.pairwise import load_pairwise_examples, split_train_val
 from .evaluate import evaluate
 from .models.checkpoint import Checkpoint, ConfigMismatchError
-from .models.config import TrainConfig
-from .models.registry import ModelBundle
+from .models.config import TrainConfig, load_config
+from .models.registry import ModelBundle, build_model
 from .negative_space import require
 
 
@@ -232,3 +235,22 @@ def train(
                 _save_checkpoint(_best_path(config), checkpoint)
 
     return checkpoint
+
+
+def main() -> None:
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Train an llm-reward model variant")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--train-csv", type=Path, default=Path("data/raw/train.csv"))
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    bundle = build_model(config)
+    examples = load_pairwise_examples(args.train_csv)
+    train_examples, val_examples = split_train_val(examples, config.val_fraction, config.seed)
+    train(config, bundle, train_examples, val_examples, resume=args.resume)
+
+
+if __name__ == "__main__":
+    main()
