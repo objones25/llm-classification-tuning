@@ -107,3 +107,17 @@ def test_real_model_is_reachable_through_the_wrapper_for_push_to_hub_dispatch(
     from transformers import PreTrainedModel
 
     assert isinstance(bundle.model.hf_model, PreTrainedModel)
+
+
+def test_gradient_checkpointing_enables_input_require_grads_when_backbone_frozen(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        sft_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model
+    )
+    monkeypatch.setattr(sft_head.AutoTokenizer, "from_pretrained", lambda _name: _FakeTokenizer())
+
+    bundle = sft_head.build_model(
+        _config(tmp_path, gradient_checkpointing=True, freeze_backbone=True)
+    )
+    assert bundle.model.hf_model.is_gradient_checkpointing

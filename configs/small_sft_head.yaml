@@ -8,3 +8,4 @@ run_name: small-sft-head-v1
 hf_model_name: Qwen/Qwen2.5-0.5B-Instruct
 max_seq_len: 1024
 head_lr: 0.001
+mixed_precision: bf16

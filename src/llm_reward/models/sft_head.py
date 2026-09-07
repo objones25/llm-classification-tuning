@@ -62,6 +62,14 @@ def build_model(config: SFTHeadConfig) -> ModelBundle:
             if not name.startswith("score"):
                 param.requires_grad = False
 
+    if config.gradient_checkpointing:
+        hf_model.gradient_checkpointing_enable()
+        if config.freeze_backbone:
+            # Without this, gradient checkpointing recomputes the frozen embedding layer's
+            # forward pass with no grad-tracking input, and backward silently produces no
+            # gradient for anything downstream. Only needed when something upstream is frozen.
+            hf_model.enable_input_require_grads()
+
     param_groups = None
     if config.head_lr is not None:
         head_params = [
