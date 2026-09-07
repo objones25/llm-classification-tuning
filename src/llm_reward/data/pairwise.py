@@ -43,7 +43,7 @@ def load_pairwise_examples(csv_path: Path) -> list[PairwiseExample]:
             elif row["winner_model_b"] == "1":
                 label = 1
             else:
-                require(row["winner_model_tie"] == "1", f"row {row['id']} has no winner set")
+                require(row["winner_tie"] == "1", f"row {row['id']} has no winner set")
                 label = 2
             examples.append(
                 PairwiseExample(

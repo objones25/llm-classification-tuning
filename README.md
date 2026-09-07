@@ -9,8 +9,8 @@ This implements a solution to Kaggle's [LLM Classification Finetuning
 competition](https://www.kaggle.com/competitions/llm-classification-finetuning): given a
 prompt and two candidate responses (`response_a`, `response_b`) from two different LLMs, predict
 which one a human judge preferred — or whether they called it a tie. The label is genuinely
-3-way (`winner_model_a` / `winner_model_b` / `winner_model_tie`) — worth stating explicitly,
-since the framing as "reward modeling" reads as a binary preference at a glance.
+3-way (`winner_model_a` / `winner_model_b` / `winner_tie`) — worth stating explicitly, since the
+framing as "reward modeling" reads as a binary preference at a glance.
 
 Rather than committing to one architecture, the project trains and compares three, in increasing
 cost order:

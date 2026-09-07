@@ -49,7 +49,7 @@ def _write_train_csv(tmp_path: Path) -> Path:
     csv_path = tmp_path / "train.csv"
     lines = [
         "id,model_a,model_b,prompt,response_a,response_b,"
-        "winner_model_a,winner_model_b,winner_model_tie"
+        "winner_model_a,winner_model_b,winner_tie"
     ]
     for i in range(10):
         label_cols = ["0", "0", "0"]

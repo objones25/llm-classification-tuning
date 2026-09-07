@@ -6,10 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Kaggle "LLM Classification Finetuning" competition: given a prompt and two LLM responses
 (`response_a`, `response_b`), predict which one a human judge preferred. The label is **3-way**
-(`winner_model_a` / `winner_model_b` / `winner_model_tie`), not strictly binary — model heads and
-loss functions must account for the tie class, even though the exploratory framing was "reward
-model." Score is a held-out test set (~25K rows); this is a Code Competition, so the submission
-pipeline must run standalone against a replaced `test.csv`.
+(`winner_model_a` / `winner_model_b` / `winner_tie`) — note the asymmetry: the tie column in both
+`train.csv` and `sample_submission.csv` is `winner_tie`, never `winner_model_tie`, despite the
+other two columns carrying the `_model_` infix. Not strictly binary — model heads and loss
+functions must account for the tie class, even though the exploratory framing was "reward model."
+Score is a held-out test set (~25K rows); this is a Code Competition, so the submission pipeline
+must run standalone against a replaced `test.csv`.
 
 Three model variants are being compared, in increasing cost order:
 
@@ -113,9 +115,8 @@ variant-agnostic; adding a fourth model idea means adding one `models/*.py` + on
 the one archive probed so far, but `submit.py` asserts this rather than assuming it: it reorders
 predictions to `sample_submission.csv`'s id order and raises if the id sets don't match exactly.
 It also outputs class **probabilities** (softmax over the 3 logits), not hard labels — the real
-`sample_submission.csv` columns are `id,winner_model_a,winner_model_b,winner_tie` (note:
-`winner_tie`, not `winner_model_tie` — that's train.csv's label-column name, not the submission
-column name).
+`sample_submission.csv` columns are `id,winner_model_a,winner_model_b,winner_tie` (same tie-column
+name `train.csv` uses — see the "Project" section above for the naming asymmetry).
 
 **Test-time examples use a sentinel label.** `test.csv` has no ground truth, but
 `PairwiseExample.label` is a mandatory int consumed by every collate_fn. `load_test_examples`
