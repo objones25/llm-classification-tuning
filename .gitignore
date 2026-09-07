@@ -12,6 +12,9 @@ wheels/
 # Secrets
 .env
 
+# Personal RunPod command reference (paths/remotes specific to this machine)
+RUNPOD_SETUP.md
+
 # Lint/test caches
 .ruff_cache/
 .pytest_cache/
