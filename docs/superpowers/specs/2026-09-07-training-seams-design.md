@@ -29,7 +29,8 @@ conventions, which already apply per `CLAUDE.md` and are referenced but not re-s
 
 ## Decisions
 
-Five forks were resolved before writing this spec; each is load-bearing for what follows.
+Six forks were resolved before writing this spec (the sixth added 2026-09-07); each is
+load-bearing for what follows.
 
 1. **Tokenization is per-variant, not shared.** `data/dataset.py` stays at the raw-text level.
    Each model variant owns its own tokenizer/vocab and supplies the `collate_fn` that turns text
@@ -56,6 +57,12 @@ Five forks were resolved before writing this spec; each is load-bearing for what
    every field optional. `LoRAConfig.lora_rank` cannot be set on an `LSTMConfig` because the type
    does not have that field — negative-space rule 9 (illegal states unrepresentable) applied to
    config loading, not just to data.
+6. **`TrainConfig` holds only fields that change the result of training**, because every field on it
+   is checked for equality on `--resume` (Section C). Anything purely operational — `num_workers`,
+   device selection — must never go on `TrainConfig`: changing machines between runs would then
+   wrongly block a legitimate resume. Operational knobs are plain CLI flags to `train.py`, never
+   checkpointed, never compared. Added 2026-09-07, after finding it would otherwise be ambiguous
+   which future fields belong where.
 
 ## A. Data contract
 
@@ -105,10 +112,16 @@ on is the five `PairwiseExample` field names and the label encoding.
 
 ## B. Model config + registry contract
 
-`models/config.py` — one frozen base, one frozen subclass per variant:
+`models/config.py` — one frozen base, one frozen subclass per variant. **All `kw_only=True`** —
+without it, `SFTHeadConfig`/`LoRAConfig` as drafted below actually raise `TypeError` at class
+definition time (verified): `hf_model_name` has no default but would land, via dataclass field
+flattening, after `TrainConfig`'s defaulted fields. `kw_only=True` removes field-ordering rules
+entirely (every constructor argument becomes keyword-only), which is the standard fix for this
+exact dataclass-inheritance pitfall, and does not change equality semantics (still needed for the
+resume config-match check in Section C):
 
 ```python
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class TrainConfig:
     variant: ClassVar[str]          # discriminator; overridden by each subclass
     seed: int
@@ -118,30 +131,41 @@ class TrainConfig:
     output_dir: Path
     run_name: str
     val_fraction: float = 0.1
-    max_seq_len: int = 512
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
+    warmup_ratio: float = 0.0
+    lr_scheduler: Literal["constant", "linear", "cosine"] = "linear"
+    class_weights: tuple[float, float, float] | None = None  # e.g. up-weight the tie class,
+                                                              # typically a minority label in this data
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class LSTMConfig(TrainConfig):
     variant: ClassVar[str] = "lstm_baseline"
+    max_seq_len: int = 256          # no pretrained model to match, so a plain default is fine here
     vocab_size: int = 30_000
     embedding_dim: int = 256
     hidden_dim: int = 512
     num_layers: int = 2
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class SFTHeadConfig(TrainConfig):
     variant: ClassVar[str] = "small_sft_head"
     hf_model_name: str
+    max_seq_len: int                # required, no default: must be chosen to fit hf_model_name's
+                                     # actual context window, not silently inherited from elsewhere
     freeze_backbone: bool = False
+    head_lr: float | None = None    # None = one lr for backbone + head; set to opt into two groups
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class LoRAConfig(TrainConfig):
     variant: ClassVar[str] = "medium_lora"
     hf_model_name: str
+    max_seq_len: int                # required, same reasoning as SFTHeadConfig
     lora_rank: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05
     target_modules: tuple[str, ...] = ("q_proj", "v_proj")
+    head_lr: float | None = None    # None = one lr for LoRA adapter + head; set to opt into two groups
 
 def load_config(yaml_path: Path) -> TrainConfig:
     """Reads the `variant:` key from the YAML file, picks the matching subclass, and constructs
@@ -159,6 +183,10 @@ CollateFn = Callable[[list[PairwiseExample]], dict[str, torch.Tensor]]
 class ModelBundle:
     model: nn.Module        # forward(**inputs) -> logits, shape [B, 3], dtype float32, finite
     collate_fn: CollateFn   # -> dict with at least "labels": LongTensor[B] in {0,1,2}
+    param_groups: list[dict] | None = None  # optional torch optimizer param groups, e.g. a
+        # lower lr for the backbone/adapter and config.head_lr for the head. None (the LSTM's
+        # case, and the HF variants' case when head_lr is None) means train.py falls back to a
+        # single flat group over every trainable parameter at config.lr.
 
 _REGISTRY: dict[str, Callable[[TrainConfig], ModelBundle]] = {}
 
@@ -253,14 +281,22 @@ Loop shape:
 
 1. `config = load_config(args.config)`; `bundle = build_model(config)`.
 2. Build train/val `DataLoader`s via `PairwiseDataset` + `bundle.collate_fn`.
-3. If `--resume` and `{config.output_dir}/last.pt` exists:
+3. Build the optimizer: `params = bundle.param_groups if bundle.param_groups is not None else
+   filter(lambda p: p.requires_grad, bundle.model.parameters())`, then
+   `optimizer = AdamW(params, lr=config.lr, weight_decay=config.weight_decay)` — PyTorch applies
+   `lr=config.lr` as the default for any group in `param_groups` that doesn't set its own `"lr"`, so
+   this one line is correct whether or not the bundle opted into differential learning rates.
+   Build the scheduler from `config.lr_scheduler`/`config.warmup_ratio` and
+   `len(train_loader) * config.epochs` — a function of config and dataset size only, needing no
+   model-specific information, so this step is identical for all three variants.
+4. If `--resume` and `{config.output_dir}/last.pt` exists:
    - Load the `Checkpoint`. `if checkpoint.config != config: raise ConfigMismatchError(...)`.
    - Restore `model_state`/`optimizer_state`/`scheduler_state`.
    - `start_epoch = checkpoint.epoch + 1`; `best_val_metric = checkpoint.best_val_metric`.
    - `wandb.init(id=checkpoint.wandb_run_id, resume="must", project=..., config=asdict(config))`.
-4. Else: `start_epoch = 0`; `best_val_metric = -inf`; `wandb.init(resume="allow", ...)` with a
+5. Else: `start_epoch = 0`; `best_val_metric = -inf`; `wandb.init(resume="allow", ...)` with a
    freshly generated run id.
-5. For `epoch in range(start_epoch, config.epochs)`: train one epoch, then
+6. For `epoch in range(start_epoch, config.epochs)`: train one epoch, then
    `metrics = evaluate(bundle.model, val_loader)`, log to W&B, then:
    - always write `Checkpoint(epoch=epoch, ..., best_val_metric=max(best_val_metric, metrics.accuracy), wandb_run_id=wandb.run.id)` to `last.pt`.
    - if `metrics.accuracy > best_val_metric`: also write the same checkpoint to `best.pt` and
@@ -314,7 +350,12 @@ implied by the interfaces:
   only.
 - `train.py`/`evaluate.py` tests use a fake `ModelBundle` (Section D) and a handful of
   `PairwiseExample`s built in-test — no real dataset, no real model, no network. This suite proves
-  the checkpoint/resume/W&B-resume state machine independent of every other component.
+  the checkpoint/resume/W&B-resume state machine independent of every other component, including
+  both the `bundle.param_groups is None` fallback and a fake bundle that sets it.
+- Constructing one instance of every `TrainConfig` subclass is itself a test, not just a type-check
+  in passing: the `kw_only` fix in Section B exists because this exact hierarchy raised `TypeError`
+  at class-definition time before the fix, which is a programmer error a test catches immediately
+  rather than one discovered later when someone finally imports `models.config`.
 
 ## E. Model persistence: Hugging Face Hub upload
 
