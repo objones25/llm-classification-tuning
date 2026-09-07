@@ -100,10 +100,10 @@ scripts/
                     # CSVs into data/raw/, the local path train.py/submit.py default to
   push_to_hub.py    # opt-in: push a reviewed checkpoint's weights (+ tokenizer, + model card) to
                     # the HF Hub — the durable store, since /workspace doesn't survive pod deletion
+  runpod_train.sh   # RunPod-only entrypoint: fails fast unless checked out under /workspace,
+                    # points HF_HOME/KAGGLEHUB_CACHE there, uv sync, download_data.py if needed,
+                    # then `uv run python -m llm_reward.train --config <config.yaml> [args...]`
 ```
-
-Not built yet, deliberately (see the spec's stated non-goals): `scripts/runpod_train.sh`. Don't
-assume it exists — check before referencing it.
 
 **Model registry is the DRY seam.** `train.py`, `evaluate.py`, and `submit.py` are all
 variant-agnostic; adding a fourth model idea means adding one `models/*.py` + one registry entry
@@ -125,9 +125,9 @@ by `PairwiseExample.__post_init__`. `submit.py` never reads the `labels` tensor 
 it drops that key from the batch before the forward pass.
 
 **RunPod workflow is manual, not scripted.** You provision/start/stop the pod yourself (RunPod
-CLI/MCP or console); this repo only needs to run cleanly over SSH once `uv sync` has been run on the
-pod. `scripts/runpod_train.sh`, once written, would document that invocation — for now, the
-expected environment is what's in the paragraphs below.
+CLI/MCP or console) and run `scripts/runpod_train.sh <config.yaml>` over SSH once `uv sync` can
+reach the pod; the script itself refuses to do anything unless the checkout is under
+`/workspace` (the disk layout the next paragraph describes).
 
 **Target pod: `runpod-torch-v280` template (`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`,
 CUDA 12.8.1 / torch 2.8.0 / Ubuntu 24.04) on an RTX PRO 6000 (Blackwell, 96GB VRAM).** `torch` in
