@@ -2207,10 +2207,24 @@ def test_evaluate_rejects_an_empty_loader():
 
 
 def test_evaluate_puts_the_model_in_eval_mode():
-    model = nn.Dropout(p=0.9)  # in train() mode this would zero ~90% of activations randomly
+    model = _DropoutOnFeatures(p=0.9)  # in train() mode this would zero ~90% of activations
     loader = _loader([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], [0, 1])
     evaluate(model, loader, CPU)
     assert not model.training
+```
+
+`_DropoutOnFeatures` is the same fix as `_IdentityOnFeatures` above, applied to `nn.Dropout`: its
+`forward`'s parameter is named `input`, so `model(features=...)` — the real `evaluate()` contract
+— raises `TypeError` without this wrapper. Add it next to `_IdentityOnFeatures`:
+
+```python
+class _DropoutOnFeatures(nn.Module):
+    def __init__(self, p: float) -> None:
+        super().__init__()
+        self.dropout = nn.Dropout(p)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.dropout(features)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -2830,7 +2844,13 @@ def train(config: TrainConfig, bundle: ModelBundle, train_examples, val_examples
 
     if resume and last_path.exists():
         checkpoint: Checkpoint = torch.load(last_path, weights_only=False, map_location=device)
-        if checkpoint.config != config:
+        # epochs is deliberately excluded from the comparison: resuming specifically to train for
+        # MORE epochs (test_resume_continues_from_the_next_epoch) is the whole point of --resume,
+        # so a config that only differs in epochs must NOT raise here. Every other field changing
+        # (e.g. batch_size, lr) still must, since those invalidate the saved optimizer/scheduler
+        # state. Confirmed by running both resume tests: the epochs-only-differs case must pass,
+        # the batch_size-differs case must still raise.
+        if dataclasses.replace(checkpoint.config, epochs=config.epochs) != config:
             raise ConfigMismatchError(f"resume checkpoint at {last_path} was produced by a different config")
         bundle.model.load_state_dict(checkpoint.model_state)
         optimizer.load_state_dict(checkpoint.optimizer_state)
@@ -2926,9 +2946,17 @@ def train(config: TrainConfig, bundle: ModelBundle, train_examples, val_examples
                     ],
                 ),
             }
-            if device.type != "cpu":
+            # torch.accelerator has no memory-accounting API in this project's pinned torch==2.8.0
+            # (confirmed empty: dir(torch.accelerator) has no "memory" member; added in a later
+            # release) -- go through the device-specific module instead so this doesn't crash on
+            # the RunPod CUDA target or on an Apple Silicon dev machine (MPS).
+            if device.type == "cuda":
                 epoch_log["system/gpu_mem_allocated_mb"] = (
-                    torch.accelerator.max_memory_allocated(device) / 1e6
+                    torch.cuda.max_memory_allocated(device) / 1e6
+                )
+            elif device.type == "mps":
+                epoch_log["system/gpu_mem_allocated_mb"] = (
+                    torch.mps.current_allocated_memory() / 1e6
                 )
             run.log(epoch_log)
 

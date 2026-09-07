@@ -366,7 +366,13 @@ Loop shape:
    - Load the `Checkpoint` with `torch.load(last_path, weights_only=False, map_location=device)` —
      `map_location` matters here specifically: a checkpoint written on a CUDA pod, resumed later on
      a machine without CUDA (or a different GPU count), fails to deserialize without it.
-   - `if checkpoint.config != config: raise ConfigMismatchError(...)`.
+   - `if dataclasses.replace(checkpoint.config, epochs=config.epochs) != config: raise
+     ConfigMismatchError(...)` — `epochs` is deliberately excluded from the comparison. Resuming
+     specifically to train for *more* epochs (edit the YAML's `epochs`, then `--resume`) is the
+     standard workflow this whole mechanism exists for; comparing `epochs` too would make that
+     workflow always raise. Every other field changing (`batch_size`, `lr`, ...) still must raise,
+     since those invalidate the saved optimizer/scheduler state. (Caught during implementation: the
+     naive `checkpoint.config != config` check was tested against exactly this scenario and failed.)
    - Restore `model_state`/`optimizer_state`/`scheduler_state`.
    - `start_epoch = checkpoint.epoch + 1`; `global_step = checkpoint.global_step`;
      `best_val_metric = checkpoint.best_val_metric`.
@@ -419,9 +425,12 @@ Loop shape:
      gap between them (the overfitting signal) is one glance on the same chart, not two lookups.
      `val/confusion_matrix` logs separately, as a `wandb.Table` built from `metrics.confusion_matrix`
      (3 rows, one per true class) — a table, not a scalar, so per-epoch only, never per-step. Also,
-     only when `device.type != "cpu"`: `run.log({"epoch": epoch, "system/gpu_mem_allocated_mb":
-     torch.accelerator.max_memory_allocated(device) / 1e6})` — cheap, and the number that answers
-     "did this variant actually fit, and with how much room" on the RunPod pod.
+     only when on an accelerator: `torch.cuda.max_memory_allocated(device)` when `device.type ==
+     "cuda"`, `torch.mps.current_allocated_memory()` when `device.type == "mps"` (`torch.accelerator`
+     itself has no memory-accounting API in this project's pinned torch==2.8.0 — confirmed empty,
+     that API was added in a later release — so the device-specific module is used directly), logged
+     as `system/gpu_mem_allocated_mb`, cheap, and the number that answers "did this variant actually
+     fit, and with how much room" on the RunPod pod.
    - `improved = metrics.accuracy > best_val_metric`; `best_val_metric = max(best_val_metric,
      metrics.accuracy)`.
    - Always write `Checkpoint(epoch=epoch, global_step=global_step, ..., wandb_run_id=run.id)` to
