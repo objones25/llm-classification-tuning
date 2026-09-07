@@ -1,0 +1,12 @@
+variant: lstm_baseline
+seed: 20260907
+batch_size: 32
+epochs: 5
+lr: 0.001
+output_dir: outputs/lstm_baseline
+run_name: lstm-baseline-v1
+max_seq_len: 256
+vocab_size: 30000
+embedding_dim: 256
+hidden_dim: 512
+num_layers: 2
