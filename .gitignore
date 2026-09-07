@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets
+.env
+
+# Lint/test caches
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Kaggle competition data (downloaded via kagglehub, not committed)
+data/
+
+# Training artifacts
+checkpoints/
+outputs/
+wandb/
+submission*.csv
+
+# macOS
+.DS_Store

@@ -1,0 +1,111 @@
+[project]
+name = "llm-reward"
+version = "0.1.0"
+description = "Kaggle LLM Classification Finetuning: pairwise preference classifier"
+readme = "README.md"
+authors = [
+    { name = "objones25", email = "59661118+objones25@users.noreply.github.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "python-dotenv>=1.0",
+    "kagglehub>=0.3",
+    "torch==2.8.0",
+    "transformers>=4.46",
+    "sentence-transformers>=3.3",
+    "peft>=0.14",
+    "wandb>=0.19",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0",
+    "pytest-cov>=6.0",
+    "ruff>=0.15",
+]
+
+[project.scripts]
+llm-reward = "llm_reward:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# torch is pinned to exactly the version baked into the RunPod pod template
+# (runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404 -> CUDA 12.8.1 / torch 2.8.0),
+# which is also the first torch release with solid Blackwell (sm_120) kernel
+# support that the RTX PRO 6000 needs. On Linux, `uv sync` pulls it from
+# PyTorch's own cu128 wheel index to match; on macOS (local dev) it falls back
+# to the default PyPI index, which has no CUDA build anyway.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+# Listed individually rather than `strict = true`: pytest is not pinned to an
+# exact version here, and `strict = true` auto-adopts future strictness
+# options that could break under a floating pytest dependency.
+strict_config = true
+strict_markers = true
+strict_parametrization_ids = true
+addopts = [
+    "--import-mode=importlib",
+    "-ra",
+    "--showlocals",
+    "--tb=short",
+    "--strict-config",
+    "--strict-markers",
+    "--cov",
+    "--cov-branch",
+    "--cov-report=term-missing:skip-covered",
+    "--cov-fail-under=0",    # bootstrap: no tests yet. Ratchet this up as tests/ fills in.
+    "-m", "not slow and not integration and not gpu",
+]
+markers = [
+    "slow: takes more than ~1s; deselected by default",
+    "integration: crosses a process, service, or network boundary (Kaggle/HF/RunPod)",
+    "gpu: requires CUDA; skipped when unavailable",
+]
+filterwarnings = ["error"]
+pythonpath = ["src"]
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+omit = ["*/tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["PT", "B", "SIM", "RUF", "E", "F", "I", "UP", "ARG", "DTZ"]
+ignore = ["PT001", "PT023"]
+
+[tool.ruff.lint.flake8-pytest-style]
+parametrize-names-type = "tuple"
+parametrize-values-type = "list"
+parametrize-values-row-type = "tuple"
+raises-require-match-for = ["BaseException", "Exception", "ValueError", "OSError", "socket.error"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "ARG001"]
+"conftest.py" = ["ARG001"]
