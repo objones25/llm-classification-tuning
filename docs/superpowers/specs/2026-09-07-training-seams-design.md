@@ -137,6 +137,10 @@ class TrainConfig:
     lr_scheduler: Literal["constant", "linear", "cosine"] = "linear"
     class_weights: tuple[float, float, float] | None = None  # e.g. up-weight the tie class,
                                                               # typically a minority label in this data
+    mixed_precision: Literal["no", "bf16"] = "no"  # bf16 needs no GradScaler (unlike fp16), so
+        # fp16 isn't offered at all: the only hardware this project trains on for real (Blackwell,
+        # via CLAUDE.md) wants bf16, and CPU/dev-machine runs are correctness tests, not throughput
+        # runs, so "no" there costs nothing. Fewer states than the code could support, on purpose.
 
 @dataclass(frozen=True, kw_only=True)
 class LSTMConfig(TrainConfig):
@@ -155,6 +159,7 @@ class SFTHeadConfig(TrainConfig):
                                      # actual context window, not silently inherited from elsewhere
     freeze_backbone: bool = False
     head_lr: float | None = None    # None = one lr for backbone + head; set to opt into two groups
+    gradient_checkpointing: bool = False
 
 @dataclass(frozen=True, kw_only=True)
 class LoRAConfig(TrainConfig):
@@ -166,6 +171,7 @@ class LoRAConfig(TrainConfig):
     lora_dropout: float = 0.05
     target_modules: tuple[str, ...] = ("q_proj", "v_proj")
     head_lr: float | None = None    # None = one lr for LoRA adapter + head; set to opt into two groups
+    gradient_checkpointing: bool = False
 
 def load_config(yaml_path: Path) -> TrainConfig:
     """Reads the `variant:` key from the YAML file, picks the matching subclass, and constructs
@@ -256,6 +262,16 @@ below: registry.py is meant to be stable after this design lands, and the wrappe
 Section E's capability dispatch checks `getattr(model, "hf_model", model)` first, so an
 `isinstance` check still sees the real `PreTrainedModel`/`PeftModel` underneath the wrapper.
 
+**`gradient_checkpointing`, when set, is `sft_head.py`'s/`lora_head.py`'s own responsibility**,
+inside `build_model`, not `train.py`'s: `hf_model.gradient_checkpointing_enable()`, and —
+whenever the backbone has any frozen parameter, which is always true for LoRA and true for
+`SFTHeadConfig` when `freeze_backbone=True` — also `hf_model.enable_input_require_grads()`.
+Without the latter, gradient checkpointing recomputes the frozen embedding layer's forward pass
+with no grad-tracking input, and backward silently produces no gradient for anything downstream.
+Confirmed against `peft`'s own docs: this is exactly what `prepare_model_for_kbit_training` does
+for the quantized case, which this project doesn't use, so it's set directly rather than pulling
+in that helper.
+
 **Uniform loss**, computed in `train.py`, never inside a model file:
 
 ```python
@@ -271,6 +287,8 @@ loss = F.cross_entropy(bundle.model(**inputs), batch["labels"])
 @dataclass
 class Checkpoint:
     epoch: int                 # last COMPLETED epoch (0-indexed)
+    global_step: int           # total training steps so far, across all epochs — carried across
+                                # resume so the W&B step x-axis doesn't reset to 0 on a new process
     model_state: dict
     optimizer_state: dict
     scheduler_state: dict | None
@@ -287,14 +305,33 @@ class ConfigMismatchError(Exception):
 `evaluate.py`:
 
 ```python
+ConfusionMatrix = tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]
+# confusion_matrix[true_label][predicted_label] = count. The single source of truth every
+# other classification metric below is derived from — never accumulated separately, so there
+# is exactly one place a counting bug could hide, not five.
+
 @dataclass(frozen=True)
 class EvalMetrics:
     loss: float
     accuracy: float
     n_examples: int
+    confusion_matrix: ConfusionMatrix
+    per_class_precision: tuple[float, float, float]  # class 0 (a), 1 (b), 2 (tie)
+    per_class_recall: tuple[float, float, float]
+    per_class_f1: tuple[float, float, float]
+    macro_f1: float  # unweighted mean of per_class_f1 — the one number that surfaces a model
+        # that quietly gave up on the minority class (tie is typically rare in this data — see
+        # class_weights in Section B), which aggregate accuracy alone hides. A class with zero
+        # true or zero predicted examples reports 0.0 for the metrics that would otherwise
+        # divide by zero — a plausible, non-erroneous state for a small eval split, not a bug.
 
-def evaluate(model: nn.Module, loader: DataLoader) -> EvalMetrics: ...
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> EvalMetrics: ...
 ```
+
+`per_class_precision[c] = confusion_matrix[c][c] / sum(confusion_matrix[i][c] for i in range(3))`
+(column sum — how often class `c` was predicted), `per_class_recall[c] = confusion_matrix[c][c] /
+sum(confusion_matrix[c])` (row sum — how often class `c` was the true label), `per_class_f1[c]` the
+harmonic mean of the two, each guarded against a zero denominator.
 
 `train.py` entry point:
 
@@ -305,8 +342,16 @@ uv run python -m llm_reward.train --config configs/<variant>.yaml [--resume]
 Loop shape:
 
 1. `config = load_config(args.config)`; `bundle = build_model(config)`.
-2. Build train/val `DataLoader`s via `PairwiseDataset` + `bundle.collate_fn`.
-3. Build the optimizer: `params = bundle.param_groups if bundle.param_groups is not None else
+2. **Device, resolved once**: `device = torch.accelerator.current_accelerator(check_available=True)
+   or torch.device("cpu")`, then `bundle.model.to(device)` (in place — `nn.Module.to()` never
+   needs reassignment, unlike a tensor's). This one call works identically for the LSTM and both
+   `_LogitsOnly`-wrapped HF models, since it's a plain `nn.Module` method — no variant branching.
+   **This step did not exist in the first draft of this spec**: without it, every tensor a
+   `collate_fn` produces stays wherever it was created (the CPU), and the RunPod GPU is never
+   actually used — a correctness gap, not a performance one, caught by reviewing the plan against
+   current PyTorch practice before implementation started.
+3. Build train/val `DataLoader`s via `PairwiseDataset` + `bundle.collate_fn`.
+4. Build the optimizer: `params = bundle.param_groups if bundle.param_groups is not None else
    filter(lambda p: p.requires_grad, bundle.model.parameters())`, then
    `optimizer = AdamW(params, lr=config.lr, weight_decay=config.weight_decay)` — PyTorch applies
    `lr=config.lr` as the default for any group in `param_groups` that doesn't set its own `"lr"`, so
@@ -314,18 +359,76 @@ Loop shape:
    Build the scheduler from `config.lr_scheduler`/`config.warmup_ratio` and
    `len(train_loader) * config.epochs` — a function of config and dataset size only, needing no
    model-specific information, so this step is identical for all three variants.
-4. If `--resume` and `{config.output_dir}/last.pt` exists:
-   - Load the `Checkpoint`. `if checkpoint.config != config: raise ConfigMismatchError(...)`.
+5. Assemble the W&B run config once: `dataclasses.asdict(config) | {"variant": config.variant,
+   "n_train_examples": len(train_examples), "n_val_examples": len(val_examples)}` — every
+   hyperparameter plus the two numbers someone will otherwise have to ask about later.
+6. If `--resume` and `{config.output_dir}/last.pt` exists:
+   - Load the `Checkpoint` with `torch.load(last_path, weights_only=False, map_location=device)` —
+     `map_location` matters here specifically: a checkpoint written on a CUDA pod, resumed later on
+     a machine without CUDA (or a different GPU count), fails to deserialize without it.
+   - `if checkpoint.config != config: raise ConfigMismatchError(...)`.
    - Restore `model_state`/`optimizer_state`/`scheduler_state`.
-   - `start_epoch = checkpoint.epoch + 1`; `best_val_metric = checkpoint.best_val_metric`.
-   - `wandb.init(id=checkpoint.wandb_run_id, resume="must", project=..., config=asdict(config))`.
-5. Else: `start_epoch = 0`; `best_val_metric = -inf`; `wandb.init(resume="allow", ...)` with a
-   freshly generated run id.
-6. For `epoch in range(start_epoch, config.epochs)`: train one epoch, then
-   `metrics = evaluate(bundle.model, val_loader)`, log to W&B, then:
-   - always write `Checkpoint(epoch=epoch, ..., best_val_metric=max(best_val_metric, metrics.accuracy), wandb_run_id=wandb.run.id)` to `last.pt`.
-   - if `metrics.accuracy > best_val_metric`: also write the same checkpoint to `best.pt` and
-     update `best_val_metric`.
+   - `start_epoch = checkpoint.epoch + 1`; `global_step = checkpoint.global_step`;
+     `best_val_metric = checkpoint.best_val_metric`.
+   - `run = wandb.init(id=checkpoint.wandb_run_id, resume="must", project="llm-reward", config=run_config)`.
+7. Else: `start_epoch = 0`; `global_step = 0`; `best_val_metric = -inf`;
+   `run = wandb.init(resume="allow", project="llm-reward", config=run_config)` with a freshly
+   generated run id.
+8. **Hold the `run` object returned by `wandb.init`; every later call is `run.log(...)`/`run.id`/
+   `run.finish()`, never the bare `wandb.*` module-level functions.** The module-level form targets
+   an implicit global run and breaks once a script does anything more than the simplest single-run
+   case — irrelevant for tests too, since a test that monkeypatches the `wandb` **module** already
+   controls what `wandb.init(...)` returns and can hand back a fake object with the same shape.
+   Declare the two W&B x-axes right after `init` so per-step logging never needs to pass `step=`
+   (a step out of order is silently dropped, no exception): `run.define_metric("train/global_step")`,
+   `run.define_metric("train/*", step_metric="train/global_step")`, `run.define_metric("epoch")`,
+   `run.define_metric("val/*", step_metric="epoch")`.
+9. For `epoch in range(start_epoch, config.epochs)`: `bundle.model.train()`, then for each batch:
+   - `batch = {k: v.to(device) for k, v in batch.items()}` — every tensor the `collate_fn` produced,
+     moved by copy (never in place for a tensor) to match where the model now lives.
+   - `inputs = {k: v for k, v in batch.items() if k != "labels"}`; `labels = batch["labels"]`.
+   - `with torch.autocast(device.type, dtype=torch.bfloat16, enabled=config.mixed_precision == "bf16"):
+     logits = bundle.model(**inputs); loss = F.cross_entropy(logits, labels, weight=class_weights)`
+     — forward and loss only; `backward()` stays outside the `autocast` block (it reuses whatever
+     dtype the matching forward op picked).
+   - `optimizer.zero_grad()` -> `loss.backward()` -> clip -> `optimizer.step()` -> `scheduler.step()`.
+     **Gradient-norm logging, and clipping, are two different questions** — clipping always stays a
+     single combined operation over every trainable parameter (`grad_norm =
+     nn.utils.clip_grad_norm_(params, config.max_grad_norm)`, unchanged from the earlier draft); but
+     when `bundle.param_groups is not None` — always exactly two groups by convention,
+     `param_groups[0]` the backbone/adapter and `param_groups[1]` the head, per Section B's
+     `sft_head.py`/`lora_head.py` — also compute (never clip on) each group's own norm purely for
+     observability: `_group_grad_norm(group["params"]) = torch.norm(torch.stack([p.grad.detach().norm()
+     for p in group["params"] if p.grad is not None])).item()` (0.0 if the group has no grad at all).
+     A single combined clip is the standard, safe default; a randomly-initialized head and a
+     pretrained-or-LoRA backbone otherwise want very different learning rates (already handled via
+     `head_lr`) and can have very different gradient scales worth *seeing* separately, which a single
+     combined norm hides.
+   - Running epoch accumulators, from the same forward pass already computed — no extra cost:
+     `epoch_loss_sum += loss.item() * labels.shape[0]`; `epoch_correct += (logits.argmax(-1) ==
+     labels).sum().item()`; `epoch_n += labels.shape[0]`.
+   - `run.log({"train/loss": loss.item(), "train/lr": scheduler.get_last_lr()[0],
+     "train/global_step": global_step})`, plus either `{"train/grad_norm": float(grad_norm)}` (when
+     `bundle.param_groups is None`) or `{"train/grad_norm_backbone": ..., "train/grad_norm_head":
+     ...}` (when it isn't) merged into the same `run.log` call; `global_step += 1`.
+   - After the epoch: `metrics = evaluate(bundle.model, val_loader, device)`, then one `run.log` call
+     carrying `epoch`, `train/epoch_loss` (`epoch_loss_sum / epoch_n`) and `train/epoch_accuracy`
+     (`epoch_correct / epoch_n`) alongside `val/loss`, `val/accuracy`, `val/macro_f1`, and
+     `val/precision_{a,b,tie}` / `val/recall_{a,b,tie}` / `val/f1_{a,b,tie}` from `metrics`' three
+     per-class tuples — training and validation land on the same `epoch` x-axis specifically so the
+     gap between them (the overfitting signal) is one glance on the same chart, not two lookups.
+     `val/confusion_matrix` logs separately, as a `wandb.Table` built from `metrics.confusion_matrix`
+     (3 rows, one per true class) — a table, not a scalar, so per-epoch only, never per-step. Also,
+     only when `device.type != "cpu"`: `run.log({"epoch": epoch, "system/gpu_mem_allocated_mb":
+     torch.accelerator.max_memory_allocated(device) / 1e6})` — cheap, and the number that answers
+     "did this variant actually fit, and with how much room" on the RunPod pod.
+   - `improved = metrics.accuracy > best_val_metric`; `best_val_metric = max(best_val_metric,
+     metrics.accuracy)`.
+   - Always write `Checkpoint(epoch=epoch, global_step=global_step, ..., wandb_run_id=run.id)` to
+     `last.pt`. If `improved`, also write it to `best.pt`.
+10. `run.finish()` after the loop (or wrap steps 8-9 in `with wandb.init(...) as run:` so a crash
+    marks the run failed automatically instead of leaving it "running" forever on the dashboard —
+    either is acceptable; the context-manager form is the one that survives an exception un-nudged).
 
 **Disk bound**: exactly two checkpoint files exist under `config.output_dir` at any time,
 regardless of `config.epochs` — the "keep last + best only" decision from above, load-bearing given
@@ -376,11 +479,22 @@ implied by the interfaces:
 - `train.py`/`evaluate.py` tests use a fake `ModelBundle` (Section D) and a handful of
   `PairwiseExample`s built in-test — no real dataset, no real model, no network. This suite proves
   the checkpoint/resume/W&B-resume state machine independent of every other component, including
-  both the `bundle.param_groups is None` fallback and a fake bundle that sets it.
+  both the `bundle.param_groups is None` fallback and a fake bundle that sets it. The test double
+  standing in for the `wandb` module must return an object from `.init(...)` that supports the
+  same shape `train.py` actually calls: `.log(...)`, `.id`, `.define_metric(...)`, and (if `train.py`
+  uses the context-manager form) `__enter__`/`__exit__` — a fake that only supports module-level
+  `wandb.log(...)` would pass tests that no longer match the code once `run.log(...)` replaces it.
+  These tests run on CPU only (no GPU in CI), so `device` resolves to `torch.device("cpu")` and
+  `torch.autocast("cpu", dtype=torch.bfloat16, enabled=...)` is exercised for real — bf16 autocast
+  works on CPU, just without the throughput win, which is exactly what a correctness test needs.
 - Constructing one instance of every `TrainConfig` subclass is itself a test, not just a type-check
   in passing: the `kw_only` fix in Section B exists because this exact hierarchy raised `TypeError`
   at class-definition time before the fix, which is a programmer error a test catches immediately
   rather than one discovered later when someone finally imports `models.config`.
+- `evaluate()`'s precision/recall/F1 are all derived from one confusion matrix (never accumulated
+  separately), so the one test worth writing deliberately is a confusion matrix with an empty row
+  or column — a class with zero true examples, or zero predicted examples — asserting the affected
+  metric reports `0.0` rather than raising `ZeroDivisionError`.
 
 ## E. Model persistence: Hugging Face Hub upload
 
@@ -403,6 +517,9 @@ def push_to_hub(checkpoint_path: Path, repo_id: str, private: bool = True) -> st
 
 - **Reconstruction reuses the existing registry seam** — `build_model(checkpoint.config)` gives
   back the right architecture; no new hook is added to `models/registry.py` or `ModelBundle`.
+  Loads with `torch.load(checkpoint_path, weights_only=False, map_location="cpu")` — this script
+  never needs a GPU at all (it only reconstructs weights to hand to the Hub), and `map_location`
+  is what makes that true regardless of which device the checkpoint was originally saved from.
 - **Push dispatch is by model capability, not by variant name** — consistent with the "plain
   `nn.Module`, no variant branching" decision in Section B. First unwrap:
   `real_model = getattr(bundle.model, "hf_model", bundle.model)` — undoes the `_LogitsOnly`
@@ -438,6 +555,12 @@ def push_to_hub(checkpoint_path: Path, repo_id: str, private: bool = True) -> st
 - Per-epoch checkpoint retention (only `last.pt` + `best.pt` exist).
 - `submit.py`'s own prediction/inference contract — a follow-up design once training exists.
 - Automatic/every-run Hub uploads, and merged (non-adapter) uploads for the LoRA variant.
+- fp16/`GradScaler` support — bf16-only, per the `mixed_precision` field's own reasoning in Section B.
+- `torch.compile` — not adopted yet. Revisit once the plain-eager loop is proven correct;
+  compiling a `peft`-wrapped model has known rough edges not worth taking on alongside everything
+  else in this plan.
+- Multi-GPU / distributed training (`DistributedDataParallel`/FSDP2) — single-GPU RunPod pod, per
+  `CLAUDE.md`.
 
 ## Open questions
 
