@@ -41,7 +41,9 @@ uv run ruff check .                      # lint
 uv run python -m llm_reward.train --config configs/lstm_baseline.yaml
 uv run python -m llm_reward.train --config configs/small_sft_head.yaml
 uv run python -m llm_reward.train --config configs/medium_lora.yaml
-uv run python -m llm_reward.submit --config configs/<same-config> --checkpoint <path>  # writes submission.csv
+# submit.py doesn't exist yet (deferred, per the spec's stated non-goals) -- this is the
+# planned invocation once it's built, not a command you can run today:
+#   uv run python -m llm_reward.submit --config configs/<same-config> --checkpoint <path>
 
 # opt-in, after reviewing a run's metrics: push that checkpoint to the HF Hub
 uv run python scripts/push_to_hub.py --checkpoint outputs/lstm_baseline/best.pt \
