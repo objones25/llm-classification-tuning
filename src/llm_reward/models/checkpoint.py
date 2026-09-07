@@ -13,7 +13,10 @@ class Checkpoint:
     model_state: dict
     optimizer_state: dict
     scheduler_state: dict | None
-    best_val_metric: float
+    best_val_metric: float  # lowest val_loss seen so far (lower is better)
+    epochs_without_improvement: int  # consecutive epochs since best_val_metric last improved --
+                                      # carried across resume so --resume doesn't reset an
+                                      # early-stopping run's patience counter back to 0
     config: TrainConfig
     wandb_run_id: str
 

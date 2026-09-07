@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from llm_reward.data.pairwise import PairwiseExample
+from llm_reward.evaluate import EvalMetrics
 from llm_reward.models.checkpoint import Checkpoint, ConfigMismatchError
 from llm_reward.models.config import LSTMConfig
 from llm_reward.models.registry import ModelBundle
@@ -80,7 +81,7 @@ def test_save_checkpoint_creates_parent_directories(tmp_path):
     config = _lstm_config(tmp_path / "nested" / "dir")
     checkpoint = Checkpoint(
         epoch=0, global_step=0, model_state={}, optimizer_state={}, scheduler_state=None,
-        best_val_metric=0.0, config=config, wandb_run_id="r",
+        best_val_metric=0.0, epochs_without_improvement=0, config=config, wandb_run_id="r",
     )
     path = _last_path(config)
     _save_checkpoint(path, checkpoint)
@@ -95,7 +96,8 @@ def test_exactly_two_checkpoint_files_exist_regardless_of_epoch_count(tmp_path):
     for epoch in range(5):
         checkpoint = Checkpoint(
             epoch=epoch, global_step=epoch * 4, model_state={}, optimizer_state={},
-            scheduler_state=None, best_val_metric=float(epoch), config=config, wandb_run_id="r",
+            scheduler_state=None, best_val_metric=float(epoch), epochs_without_improvement=0,
+            config=config, wandb_run_id="r",
         )
         _save_checkpoint(_last_path(config), checkpoint)
         _save_checkpoint(_best_path(config), checkpoint)
@@ -166,6 +168,27 @@ def _examples(n: int) -> list[PairwiseExample]:
 def _epoch_entries(logged: list[dict]) -> list[dict]:
     """Per-epoch summary entries (they carry an 'epoch' key); per-step entries don't."""
     return [entry for entry in logged if "epoch" in entry]
+
+
+def _canned_metrics(losses: list[float]):
+    """Stands in for evaluate(): returns one EvalMetrics per call, loss taken from `losses` in
+    order, so a test can script an exact val_loss curve instead of depending on what a tiny
+    randomly-initialized model happens to produce."""
+    it = iter(losses)
+
+    def fake_evaluate(model, loader, device):
+        return EvalMetrics(
+            loss=next(it),
+            accuracy=0.5,
+            n_examples=1,
+            confusion_matrix=((0, 0, 0), (0, 0, 0), (0, 0, 0)),
+            per_class_precision=(0.0, 0.0, 0.0),
+            per_class_recall=(0.0, 0.0, 0.0),
+            per_class_f1=(0.0, 0.0, 0.0),
+            macro_f1=0.0,
+        )
+
+    return fake_evaluate
 
 
 def test_train_runs_and_writes_both_checkpoint_files(tmp_path, monkeypatch):
@@ -310,12 +333,90 @@ def test_resume_with_a_changed_config_raises_config_mismatch_error(tmp_path, mon
         train(different_config, _fake_bundle(), _examples(8), _examples(4), resume=True)
 
 
+def test_best_checkpoint_criterion_is_val_loss_not_accuracy(tmp_path, monkeypatch):
+    """Accuracy improves every epoch here while loss gets worse after epoch 0 -- best.pt must
+    still land on epoch 0, proving the criterion really is loss, not accuracy."""
+    import llm_reward.train as train_module
+
+    monkeypatch.setattr(train_module, "wandb", _FakeWandb())
+    monkeypatch.setattr(train_module, "evaluate", _canned_metrics([1.0, 1.5, 1.6]))
+    config = _lstm_config(tmp_path, epochs=3, batch_size=2)
+
+    train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
+
+    best: Checkpoint = torch.load(_best_path(config), weights_only=False, map_location="cpu")
+    assert best.epoch == 0
+    assert best.best_val_metric == 1.0
+
+
+def test_early_stopping_disabled_by_default_runs_every_epoch(tmp_path, monkeypatch):
+    import llm_reward.train as train_module
+
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(train_module, "wandb", fake_wandb)
+    monkeypatch.setattr(train_module, "evaluate", _canned_metrics([1.0, 1.1, 1.2, 1.3]))
+    config = _lstm_config(tmp_path, epochs=4, batch_size=2)  # early_stopping_patience=None
+
+    train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
+
+    assert [entry["epoch"] for entry in _epoch_entries(fake_wandb.logged)] == [0, 1, 2, 3]
+
+
+def test_early_stopping_breaks_after_patience_epochs_without_improvement(tmp_path, monkeypatch):
+    import llm_reward.train as train_module
+
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(train_module, "wandb", fake_wandb)
+    # loss improves at epoch 0, then never again -- patience=2 should stop after epoch 2
+    # (epochs 1 and 2 both fail to improve on epoch 0's 1.0).
+    monkeypatch.setattr(train_module, "evaluate", _canned_metrics([1.0, 1.1, 1.2, 1.3, 1.4]))
+    config = _lstm_config(tmp_path, epochs=10, batch_size=2, early_stopping_patience=2)
+
+    train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
+
+    assert [entry["epoch"] for entry in _epoch_entries(fake_wandb.logged)] == [0, 1, 2]
+
+
+def test_resume_carries_over_epochs_without_improvement(tmp_path, monkeypatch):
+    """A resumed run's patience counter must continue where it left off, not reset to 0 -- else
+    --resume would silently grant extra patience an uninterrupted run would never have had."""
+    import llm_reward.train as train_module
+
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(train_module, "wandb", fake_wandb)
+    monkeypatch.setattr(train_module, "evaluate", _canned_metrics([1.0, 1.1]))
+    config = _lstm_config(tmp_path, epochs=2, batch_size=2, early_stopping_patience=3)
+    train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
+
+    last: Checkpoint = torch.load(_last_path(config), weights_only=False, map_location="cpu")
+    assert last.epochs_without_improvement == 1
+
+    fake_wandb.logged.clear()
+    monkeypatch.setattr(train_module, "evaluate", _canned_metrics([1.2, 1.3]))
+    resumed_config = _lstm_config(
+        tmp_path, epochs=4, batch_size=2, early_stopping_patience=3
+    )
+    train(resumed_config, _fake_bundle(), _examples(8), _examples(4), resume=True)
+
+    # epoch 2 -> epochs_without_improvement 2, epoch 3 -> 3 == patience -> stops there
+    assert [entry["epoch"] for entry in _epoch_entries(fake_wandb.logged)] == [2, 3]
+
+
 def test_train_rejects_zero_epochs(tmp_path, monkeypatch):
     import llm_reward.train as train_module
 
     monkeypatch.setattr(train_module, "wandb", _FakeWandb())
     config = _lstm_config(tmp_path, epochs=0, batch_size=2)
     with pytest.raises(CheckFailed, match="epochs"):
+        train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
+
+
+def test_train_rejects_non_positive_early_stopping_patience(tmp_path, monkeypatch):
+    import llm_reward.train as train_module
+
+    monkeypatch.setattr(train_module, "wandb", _FakeWandb())
+    config = _lstm_config(tmp_path, epochs=1, batch_size=2, early_stopping_patience=0)
+    with pytest.raises(CheckFailed, match="early_stopping_patience"):
         train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
 
 

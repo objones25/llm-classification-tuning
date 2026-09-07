@@ -48,7 +48,8 @@ def _write_checkpoint(tmp_path: Path) -> Path:
     )
     checkpoint = Checkpoint(
         epoch=0, global_step=0, model_state=model.state_dict(), optimizer_state={},
-        scheduler_state=None, best_val_metric=0.9, config=config, wandb_run_id="r",
+        scheduler_state=None, best_val_metric=0.9, epochs_without_improvement=0,
+        config=config, wandb_run_id="r",
     )
     checkpoint_path = tmp_path / "best.pt"
     torch.save(checkpoint, checkpoint_path)

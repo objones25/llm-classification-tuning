@@ -25,6 +25,9 @@ class TrainConfig:
     lr_scheduler: Literal["constant", "linear", "cosine"] = "linear"
     class_weights: tuple[float, float, float] | None = None
     mixed_precision: Literal["no", "bf16"] = "no"
+    # None disables early stopping (the historical behavior: always run all `epochs`). When set,
+    # training stops once val_loss hasn't improved for this many consecutive epochs.
+    early_stopping_patience: int | None = None
 
 
 @dataclass(frozen=True, kw_only=True)

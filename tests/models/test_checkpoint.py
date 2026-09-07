@@ -18,6 +18,7 @@ def test_checkpoint_round_trips_through_torch_save(tmp_path):
         optimizer_state={},
         scheduler_state=None,
         best_val_metric=0.5,
+        epochs_without_improvement=0,
         config=_config(),
         wandb_run_id="run-123",
     )

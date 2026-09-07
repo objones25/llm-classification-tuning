@@ -80,6 +80,10 @@ def train(
     require(config.epochs >= 1, f"epochs must be at least 1, got {config.epochs}")
     require(len(train_examples) > 0, "train() received zero training examples")
     require(len(val_examples) > 0, "train() received zero validation examples")
+    require(
+        config.early_stopping_patience is None or config.early_stopping_patience >= 1,
+        f"early_stopping_patience must be at least 1 or None, got {config.early_stopping_patience}",
+    )
 
     device = torch.accelerator.current_accelerator(check_available=True) or torch.device("cpu")
     bundle.model.to(device)
@@ -135,12 +139,14 @@ def train(
         start_epoch = checkpoint.epoch + 1
         global_step = checkpoint.global_step
         best_val_metric = checkpoint.best_val_metric
+        epochs_without_improvement = checkpoint.epochs_without_improvement
         wandb_run_id = checkpoint.wandb_run_id
         wandb_resume = "must"
     else:
         start_epoch = 0
         global_step = 0
-        best_val_metric = float("-inf")
+        best_val_metric = float("inf")
+        epochs_without_improvement = 0
         checkpoint = None
         wandb_run_id = None
         wandb_resume = "allow"
@@ -247,8 +253,9 @@ def train(
                 )
             run.log(epoch_log)
 
-            improved = metrics.accuracy > best_val_metric
-            best_val_metric = max(best_val_metric, metrics.accuracy)
+            improved = metrics.loss < best_val_metric
+            best_val_metric = min(best_val_metric, metrics.loss)
+            epochs_without_improvement = 0 if improved else epochs_without_improvement + 1
             checkpoint = Checkpoint(
                 epoch=epoch,
                 global_step=global_step,
@@ -256,12 +263,23 @@ def train(
                 optimizer_state=optimizer.state_dict(),
                 scheduler_state=scheduler.state_dict(),
                 best_val_metric=best_val_metric,
+                epochs_without_improvement=epochs_without_improvement,
                 config=config,
                 wandb_run_id=run.id,
             )
             _save_checkpoint(last_path, checkpoint)
             if improved:
                 _save_checkpoint(_best_path(config), checkpoint)
+
+            if (
+                config.early_stopping_patience is not None
+                and epochs_without_improvement >= config.early_stopping_patience
+            ):
+                print(
+                    f"Early stopping: val_loss did not improve for {epochs_without_improvement} "
+                    f"epochs (patience={config.early_stopping_patience})"
+                )
+                break
 
     # Reached only via the resume branch (checkpoint loaded, never None) or after the for loop
     # above ran at least once (guaranteed by the epochs >= 1 require() at the top of this

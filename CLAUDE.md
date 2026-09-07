@@ -135,6 +135,17 @@ noted above). `scripts/download_data.py` runs the same check on all three files 
 before copying them into `data/raw/` — so a schema change on Kaggle's end is caught at download
 time, not partway through a training run.
 
+**Best-checkpoint criterion is val_loss, and early stopping is opt-in per config.** `best.pt` is
+saved whenever `val_loss` improves (not `val_accuracy` — a real run's accuracy stayed flat/noisy
+across all 5 epochs while loss moved cleanly, so loss is the metric that shows when a run has
+started overfitting). `TrainConfig.early_stopping_patience` (default `None`, disabled)
+stops the run once `val_loss` hasn't improved for that many consecutive epochs.
+`Checkpoint.epochs_without_improvement` carries the patience counter across `--resume` so a
+resumed run continues counting instead of resetting to 0. **Checkpoints saved before this
+feature existed are incompatible for resume**: their `best_val_metric` holds an accuracy value,
+which this code now reads as a loss — delete old `outputs/*/{last,best}.pt` rather than resume
+from them.
+
 **RunPod workflow is manual, not scripted.** You provision/start/stop the pod yourself (RunPod
 CLI/MCP or console) and run `scripts/runpod_train.sh <config.yaml>` over SSH once `uv sync` can
 reach the pod; the script itself refuses to do anything unless the checkout is under
