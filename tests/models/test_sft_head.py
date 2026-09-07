@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 from transformers import AutoModelForSequenceClassification, Qwen2Config
 
@@ -22,8 +24,11 @@ class _FakeTokenizer:
     pad_token = "<pad>"
 
 
-def _config(tmp_path, **overrides) -> SFTHeadConfig:
-    kwargs = dict(
+def _config(tmp_path, **overrides: Any) -> SFTHeadConfig:
+    # dict[str, Any]: splatted into SFTHeadConfig's constructor, which has a different field type
+    # per key -- a concrete value type here would make Pyright check every field against one
+    # uniform type instead.
+    kwargs: dict[str, Any] = dict(
         seed=1, batch_size=2, epochs=1, lr=1e-4, output_dir=tmp_path, run_name="r",
         hf_model_name="unused-because-mocked", max_seq_len=16,
     )
@@ -120,4 +125,7 @@ def test_gradient_checkpointing_enables_input_require_grads_when_backbone_frozen
     bundle = sft_head.build_model(
         _config(tmp_path, gradient_checkpointing=True, freeze_backbone=True)
     )
-    assert bundle.model.hf_model.is_gradient_checkpointing
+    # ModelBundle.model is typed as the general nn.Module (the registry's DRY seam), so `.hf_model`
+    # (a LogitsOnly-only attribute) isn't statically visible and Pyright falls back to
+    # nn.Module.__getattr__'s stubbed `Tensor | Module` return type -- a stub gap, not a real bug.
+    assert bundle.model.hf_model.is_gradient_checkpointing  # pyright: ignore[reportAttributeAccessIssue]

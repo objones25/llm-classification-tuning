@@ -1,4 +1,6 @@
 
+from typing import Any
+
 import torch
 from transformers import AutoModelForSequenceClassification, Qwen2Config
 
@@ -23,8 +25,11 @@ class _FakeTokenizer:
     pad_token = "<pad>"
 
 
-def _config(tmp_path, **overrides) -> LoRAConfig:
-    kwargs = dict(
+def _config(tmp_path, **overrides: Any) -> LoRAConfig:
+    # dict[str, Any]: splatted into LoRAConfig's constructor, which has a different field type
+    # per key -- a concrete value type here would make Pyright check every field against one
+    # uniform type instead.
+    kwargs: dict[str, Any] = dict(
         seed=1, batch_size=2, epochs=1, lr=1e-3, output_dir=tmp_path, run_name="r",
         hf_model_name="unused-because-mocked", max_seq_len=16,
         lora_rank=4, lora_alpha=8,
@@ -57,7 +62,13 @@ def test_backbone_is_frozen_except_lora_and_head(tmp_path, monkeypatch):
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
 
     bundle = lora_head.build_model(_config(tmp_path))
-    trainable = [n for n, p in bundle.model.hf_model.named_parameters() if p.requires_grad]
+    # ModelBundle.model is typed as the general nn.Module (the registry's DRY seam), so `.hf_model`
+    # (a LogitsOnly-only attribute) isn't statically visible and Pyright falls back to
+    # nn.Module.__getattr__'s stubbed `Tensor | Module` return type -- a stub gap, not a real bug.
+    trainable = [
+        n for n, p in bundle.model.hf_model.named_parameters()  # pyright: ignore[reportAttributeAccessIssue]
+        if p.requires_grad
+    ]
     assert trainable  # something is trainable
     assert all("lora_" in n or "modules_to_save" in n for n in trainable)
 
@@ -121,4 +132,6 @@ def test_gradient_checkpointing_enables_input_require_grads(tmp_path, monkeypatc
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
 
     bundle = lora_head.build_model(_config(tmp_path, gradient_checkpointing=True))
-    assert bundle.model.hf_model.is_gradient_checkpointing
+    # See the pyright: ignore comment on test_backbone_is_frozen_except_lora_and_head above --
+    # same nn.Module.__getattr__ stub gap for the type-erased ModelBundle.model.hf_model access.
+    assert bundle.model.hf_model.is_gradient_checkpointing  # pyright: ignore[reportAttributeAccessIssue]

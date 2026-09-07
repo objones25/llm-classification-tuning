@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -12,8 +13,13 @@ from llm_reward.models.config import (
 )
 
 
-def _base_kwargs(**overrides):
-    kwargs = dict(seed=1, batch_size=8, epochs=2, lr=1e-3, output_dir=Path("out"), run_name="r")
+def _base_kwargs(**overrides: Any) -> dict[str, Any]:
+    # Untyped dict[str, Any]: it's splatted into each variant's dataclass constructor, which has
+    # a different field type per key -- a concrete value type here would make Pyright check every
+    # field against one uniform type instead.
+    kwargs: dict[str, Any] = dict(
+        seed=1, batch_size=8, epochs=2, lr=1e-3, output_dir=Path("out"), run_name="r"
+    )
     kwargs.update(overrides)
     return kwargs
 
@@ -59,7 +65,7 @@ def test_gradient_checkpointing_defaults_to_false_on_hf_backed_variants():
 def test_configs_are_frozen():
     config = LSTMConfig(**_base_kwargs())
     with pytest.raises(AttributeError):
-        config.lr = 0.1
+        config.lr = 0.1  # pyright: ignore[reportAttributeAccessIssue] -- the mutation under test
 
 
 def test_two_configs_with_same_fields_are_equal():

@@ -59,7 +59,11 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> Eval
         loss=total_loss / total_examples,
         accuracy=correct / total_examples,
         n_examples=total_examples,
-        confusion_matrix=(tuple(confusion[0]), tuple(confusion[1]), tuple(confusion[2])),
+        confusion_matrix=(
+            (confusion[0][0], confusion[0][1], confusion[0][2]),
+            (confusion[1][0], confusion[1][1], confusion[1][2]),
+            (confusion[2][0], confusion[2][1], confusion[2][2]),
+        ),
         per_class_precision=tuple(precision),
         per_class_recall=tuple(recall),
         per_class_f1=tuple(f1),

@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -7,8 +8,11 @@ from llm_reward.models.config import LSTMConfig
 from llm_reward.models.registry import ModelBundle, build_model
 
 
-def _config(**overrides):
-    kwargs = dict(
+def _config(**overrides: Any) -> LSTMConfig:
+    # dict[str, Any]: splatted into LSTMConfig's constructor, which has a different field type
+    # per key -- a concrete value type here would make Pyright check every field against one
+    # uniform type instead.
+    kwargs: dict[str, Any] = dict(
         seed=1, batch_size=2, epochs=1, lr=1e-2, output_dir=Path("out"), run_name="r",
         vocab_size=200, max_seq_len=8,
     )

@@ -1,3 +1,5 @@
+from typing import Any
+
 import pytest
 import torch
 from torch import nn
@@ -26,8 +28,13 @@ class _TinyClassifier(nn.Module):
         return self.linear(features)
 
 
-def _lstm_config(tmp_path, **overrides) -> LSTMConfig:
-    kwargs = dict(seed=1, batch_size=2, epochs=2, lr=1e-2, output_dir=tmp_path, run_name="r")
+def _lstm_config(tmp_path, **overrides: Any) -> LSTMConfig:
+    # dict[str, Any]: splatted into LSTMConfig's constructor, which has a different field type
+    # per key -- a concrete value type here would make Pyright check every field against one
+    # uniform type instead.
+    kwargs: dict[str, Any] = dict(
+        seed=1, batch_size=2, epochs=2, lr=1e-2, output_dir=tmp_path, run_name="r"
+    )
     kwargs.update(overrides)
     return LSTMConfig(**kwargs)
 
@@ -282,10 +289,12 @@ def test_resume_with_a_wandb_run_id_reuses_it(tmp_path, monkeypatch):
     config = _lstm_config(tmp_path, epochs=1, batch_size=2)
 
     train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
+    assert fake_wandb.run is not None  # train() always calls wandb.init(), which sets it
     first_run_id = fake_wandb.run.id
 
     resumed_config = _lstm_config(tmp_path, epochs=2, batch_size=2)
     train(resumed_config, _fake_bundle(), _examples(8), _examples(4), resume=True)
+    assert fake_wandb.run is not None
     assert fake_wandb.run.id == first_run_id
 
 

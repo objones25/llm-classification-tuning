@@ -4,12 +4,19 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from ..negative_space import require
 from ._hf_common import LogitsOnly, make_hf_collate_fn
-from .config import SFTHeadConfig
+from .config import SFTHeadConfig, TrainConfig
 from .registry import ModelBundle, register
 
 
 @register(SFTHeadConfig.variant)
-def build_model(config: SFTHeadConfig) -> ModelBundle:
+def build_model(config: TrainConfig) -> ModelBundle:
+    # BuildFn takes the common TrainConfig so the registry dict stays homogeneously typed;
+    # the registry only ever dispatches a variant's config to its own builder (see
+    # registry.build_model), so a mismatch here is a programmer error, not an operating one.
+    require(
+        isinstance(config, SFTHeadConfig), f"small_sft_head builder got a {type(config).__name__}"
+    )
+    assert isinstance(config, SFTHeadConfig)  # redundant at runtime; narrows for the type checker
     tokenizer = AutoTokenizer.from_pretrained(config.hf_model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token

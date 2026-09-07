@@ -48,7 +48,11 @@ def push_to_hub(checkpoint_path: Path, repo_id: str, private: bool = True) -> st
         # transformers/peft both return a huggingface_hub CommitInfo here, despite the `-> str`
         # annotation on PushToHubMixin.push_to_hub (CommitInfo subclasses str for backwards
         # compatibility, but reading it as a string is deprecated — go through .commit_url).
-        result = real_model.push_to_hub(repo_id, private=private)
+        # `real_model`'s static type collapses to nn.Module here (the `getattr(..., default)`
+        # fallback and the PeftModel-or-() try/except import both defeat Pyright's isinstance
+        # narrowing), so it misreads push_to_hub via nn.Module.__getattr__'s stubbed `Tensor |
+        # Module` return type instead of the real PushToHubMixin method.
+        result = real_model.push_to_hub(repo_id, private=private)  # pyright: ignore[reportCallIssue]
     else:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)

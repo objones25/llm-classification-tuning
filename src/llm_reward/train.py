@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import sys
 from pathlib import Path
+from typing import Literal
 
 import torch
 import wandb
@@ -113,8 +114,13 @@ def train(
         "n_val_examples": len(val_examples),
     }
 
+    checkpoint: Checkpoint | None
+    wandb_run_id: str | None
+    wandb_resume: Literal["must", "allow"]
     if resume and last_path.exists():
-        checkpoint: Checkpoint = torch.load(last_path, weights_only=False, map_location=device)
+        checkpoint = torch.load(last_path, weights_only=False, map_location=device)
+        # torch.load returns Any; the assert narrows the type for the type checker
+        assert isinstance(checkpoint, Checkpoint)
         # epochs is deliberately excluded from the equality check: extending a run's total epoch
         # budget across a resume is the whole point of --resume (see test_resume_continues_from_
         # the_next_epoch). Every other field still has to match exactly.
@@ -129,15 +135,19 @@ def train(
         start_epoch = checkpoint.epoch + 1
         global_step = checkpoint.global_step
         best_val_metric = checkpoint.best_val_metric
-        init_kwargs = {"id": checkpoint.wandb_run_id, "resume": "must"}
+        wandb_run_id = checkpoint.wandb_run_id
+        wandb_resume = "must"
     else:
         start_epoch = 0
         global_step = 0
         best_val_metric = float("-inf")
         checkpoint = None
-        init_kwargs = {"resume": "allow"}
+        wandb_run_id = None
+        wandb_resume = "allow"
 
-    with wandb.init(project="llm-reward", config=run_config, **init_kwargs) as run:
+    with wandb.init(
+        project="llm-reward", config=run_config, id=wandb_run_id, resume=wandb_resume
+    ) as run:
         run.define_metric("train/global_step")
         run.define_metric("train/*", step_metric="train/global_step")
         run.define_metric("epoch")
@@ -163,6 +173,8 @@ def train(
                 optimizer.zero_grad()
                 loss.backward()
 
+                grad_norm_backbone: float | None = None
+                grad_norm_head: float | None = None
                 if bundle.param_groups is not None:
                     grad_norm_backbone = _group_grad_norm(bundle.param_groups[0]["params"])
                     grad_norm_head = _group_grad_norm(bundle.param_groups[1]["params"])
@@ -182,7 +194,7 @@ def train(
                     "train/lr": scheduler.get_last_lr()[0],
                     "train/global_step": global_step,
                 }
-                if bundle.param_groups is not None:
+                if grad_norm_backbone is not None:
                     step_log["train/grad_norm_backbone"] = grad_norm_backbone
                     step_log["train/grad_norm_head"] = grad_norm_head
                 else:
@@ -251,6 +263,10 @@ def train(
             if improved:
                 _save_checkpoint(_best_path(config), checkpoint)
 
+    # Reached only via the resume branch (checkpoint loaded, never None) or after the for loop
+    # above ran at least once (guaranteed by the epochs >= 1 require() at the top of this
+    # function), which always reassigns checkpoint to a real Checkpoint.
+    assert checkpoint is not None
     return checkpoint
 
 

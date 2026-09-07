@@ -24,4 +24,4 @@ def test_rejects_empty_id():
 def test_is_frozen():
     example = PairwiseExample(id="1", prompt="p", response_a="a", response_b="b", label=0)
     with pytest.raises(AttributeError):
-        example.label = 1
+        example.label = 1  # pyright: ignore[reportAttributeAccessIssue] -- the mutation under test

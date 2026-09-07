@@ -8,7 +8,7 @@ from torch import nn
 from ..data.pairwise import PairwiseExample
 from ..negative_space import require
 from ._common import format_input
-from .config import LSTMConfig
+from .config import LSTMConfig, TrainConfig
 from .registry import ModelBundle, register
 
 
@@ -54,7 +54,12 @@ class LSTMClassifier(nn.Module):
 
 
 @register(LSTMConfig.variant)
-def build_model(config: LSTMConfig) -> ModelBundle:
+def build_model(config: TrainConfig) -> ModelBundle:
+    # BuildFn takes the common TrainConfig so the registry dict stays homogeneously typed;
+    # the registry only ever dispatches a variant's config to its own builder (see
+    # registry.build_model), so a mismatch here is a programmer error, not an operating one.
+    require(isinstance(config, LSTMConfig), f"lstm_baseline builder got a {type(config).__name__}")
+    assert isinstance(config, LSTMConfig)  # redundant at runtime; narrows for the type checker
     model = LSTMClassifier(
         vocab_size=config.vocab_size,
         embedding_dim=config.embedding_dim,
