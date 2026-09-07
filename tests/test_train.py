@@ -1,9 +1,16 @@
 import torch
 from torch import nn
 
+from llm_reward.models.checkpoint import Checkpoint
 from llm_reward.models.config import LSTMConfig
 from llm_reward.models.registry import ModelBundle
-from llm_reward.train import _make_optimizer, _make_scheduler
+from llm_reward.train import (
+    _best_path,
+    _last_path,
+    _make_optimizer,
+    _make_scheduler,
+    _save_checkpoint,
+)
 
 
 class _TinyClassifier(nn.Module):
@@ -50,3 +57,35 @@ def test_make_scheduler_runs_without_a_model_specific_argument(tmp_path):
         optimizer, _lstm_config(tmp_path, warmup_ratio=0.1), num_training_steps=10
     )
     assert scheduler is not None
+
+
+def test_last_and_best_paths_are_under_output_dir(tmp_path):
+    config = _lstm_config(tmp_path)
+    assert _last_path(config) == tmp_path / "last.pt"
+    assert _best_path(config) == tmp_path / "best.pt"
+
+
+def test_save_checkpoint_creates_parent_directories(tmp_path):
+    config = _lstm_config(tmp_path / "nested" / "dir")
+    checkpoint = Checkpoint(
+        epoch=0, global_step=0, model_state={}, optimizer_state={}, scheduler_state=None,
+        best_val_metric=0.0, config=config, wandb_run_id="r",
+    )
+    path = _last_path(config)
+    _save_checkpoint(path, checkpoint)
+    assert path.exists()
+    loaded: Checkpoint = torch.load(path, weights_only=False, map_location="cpu")
+    assert loaded.epoch == 0
+
+
+def test_exactly_two_checkpoint_files_exist_regardless_of_epoch_count(tmp_path):
+    """Bounded disk use: only last.pt and best.pt, never one file per epoch."""
+    config = _lstm_config(tmp_path)
+    for epoch in range(5):
+        checkpoint = Checkpoint(
+            epoch=epoch, global_step=epoch * 4, model_state={}, optimizer_state={},
+            scheduler_state=None, best_val_metric=float(epoch), config=config, wandb_run_id="r",
+        )
+        _save_checkpoint(_last_path(config), checkpoint)
+        _save_checkpoint(_best_path(config), checkpoint)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["best.pt", "last.pt"]
