@@ -1,0 +1,13 @@
+variant: medium_lora
+seed: 20260907
+batch_size: 8
+epochs: 3
+lr: 0.0002
+output_dir: outputs/medium_lora
+run_name: medium-lora-v1
+hf_model_name: Qwen/Qwen2.5-7B-Instruct
+max_seq_len: 2048
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+head_lr: 0.001
