@@ -26,7 +26,9 @@ def test_lstm_config_constructs_with_defaults():
 
 
 def test_sft_head_config_requires_hf_model_name_and_max_seq_len():
-    config = SFTHeadConfig(**_base_kwargs(), hf_model_name="Qwen/Qwen2.5-0.5B-Instruct", max_seq_len=1024)
+    config = SFTHeadConfig(
+        **_base_kwargs(), hf_model_name="Qwen/Qwen2.5-0.5B-Instruct", max_seq_len=1024
+    )
     assert config.variant == "small_sft_head"
     assert config.head_lr is None
 

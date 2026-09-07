@@ -30,18 +30,22 @@ uv add <package>                         # add a runtime dependency
 uv add --dev <package>                   # add a dev/test-only dependency
 
 uv run pytest                            # full unit suite (fast, no network, no GPU)
-uv run pytest tests/unit/test_pairwise.py::test_tie_label_is_preserved   # single test
-uv run pytest -m integration             # integration suite: hits Kaggle/HF/RunPod for real, opt-in only
-uv run pytest -m gpu                     # GPU-marked tests, opt-in only
+# single test — `--no-cov` because the suite-wide `--cov-fail-under=90` gate in addopts would
+# otherwise fail any partial run
+uv run pytest --no-cov tests/data/test_pairwise_loading.py::test_load_pairwise_examples_parses_all_rows
+uv run pytest --no-cov -m integration    # integration suite: hits Kaggle/HF/RunPod for real, opt-in only
+uv run pytest --no-cov -m gpu            # GPU-marked tests, opt-in only
 
 uv run ruff check .                      # lint
-uv run python scripts/audit_negative_space.py src/ --select NSP002,NSP003,NSP005,NSP006,NSP007  # hard gate
-uv run python scripts/download_data.py   # kagglehub competition_download, writes to data/raw/
 
 uv run python -m llm_reward.train --config configs/lstm_baseline.yaml
 uv run python -m llm_reward.train --config configs/small_sft_head.yaml
 uv run python -m llm_reward.train --config configs/medium_lora.yaml
 uv run python -m llm_reward.submit --config configs/<same-config> --checkpoint <path>  # writes submission.csv
+
+# opt-in, after reviewing a run's metrics: push that checkpoint to the HF Hub
+uv run python scripts/push_to_hub.py --checkpoint outputs/lstm_baseline/best.pt \
+    --repo-id objones25/llm-reward-lstm-baseline
 ```
 
 `.env` (already present, loaded via `python-dotenv` at process entry only — never inside library
@@ -57,8 +61,6 @@ variation point avoids duplicating the data/train/eval/submit path three times (
 
 ```
 src/llm_reward/
-  config.py        # dataclasses (one per variant) loaded from configs/*.yaml — YAML because RunPod
-                    # jobs and future W&B sweeps need file-based configs, not just CLI args
   data/
     download.py     # thin wrapper around kagglehub.competition_download — the only place that touches
                     # the network for data; everything downstream takes a local path
@@ -66,6 +68,8 @@ src/llm_reward/
                     # owns tie handling and any prompt/response truncation policy
     dataset.py      # torch Dataset/collate_fn over pairwise records, shared by all 3 variants
   models/
+    config.py       # dataclasses (one per variant) loaded from configs/*.yaml — YAML because RunPod
+                    # jobs and future W&B sweeps need file-based configs, not just CLI args
     registry.py     # name -> build_model(config) dispatch; the ONE place that knows about all
                     # three variants — train.py/submit.py never branch on model type themselves
     lstm_baseline.py

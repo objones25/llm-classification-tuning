@@ -123,7 +123,7 @@ class _FakeWandb:
         self.run: _FakeRun | None = None
         self._next_id = 0
 
-    def init(self, *, project, config=None, id=None, resume=None):  # noqa: ARG002
+    def init(self, *, project, config=None, id=None, resume=None):
         self.run = _FakeRun(id or f"fake-run-{self._next_id}", self.logged)
         self._next_id += 1
         return self.run
@@ -317,3 +317,24 @@ def test_train_rejects_empty_train_examples(tmp_path, monkeypatch):
     config = _lstm_config(tmp_path, epochs=1, batch_size=2)
     with pytest.raises(CheckFailed, match="training examples"):
         train(config, _fake_bundle(), [], _examples(4), resume=False)
+
+
+def test_train_rejects_a_collate_fn_that_omits_labels_before_the_loop_starts(
+    tmp_path, monkeypatch
+):
+    """collate_fn's output shape is static, so this is checked once on the first batch rather
+    than once per step -- and it must fail before any W&B run is opened, not mid-epoch."""
+    import llm_reward.train as train_module
+
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(train_module, "wandb", fake_wandb)
+    bundle = ModelBundle(
+        model=_TinyClassifier(),
+        collate_fn=lambda batch: {"features": torch.randn(len(batch), 4)},
+    )
+    config = _lstm_config(tmp_path, epochs=1, batch_size=2)
+
+    with pytest.raises(CheckFailed, match="labels"):
+        train(config, bundle, _examples(8), _examples(4), resume=False)
+
+    assert fake_wandb.run is None  # failed fast: never got as far as starting a run

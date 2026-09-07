@@ -109,3 +109,9 @@ def test_evaluate_puts_the_model_in_eval_mode():
     loader = _loader([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], [0, 1])
     evaluate(model, loader, CPU)
     assert not model.training
+    # Behavioural proof, not just a flag check: dropout in eval mode is the identity, so two
+    # calls with the same input agree exactly. In train mode with p=0.9 they almost never would.
+    features = torch.tensor([[1.0, 1.0, 1.0]])
+    first = model(features)
+    second = model(features)
+    torch.testing.assert_close(first, second)

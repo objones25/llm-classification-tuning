@@ -3,13 +3,8 @@ from pathlib import Path
 import pytest
 from torch import nn
 
-from llm_reward.models.config import LSTMConfig
 from llm_reward.models.registry import ModelBundle, build_model, register
 from llm_reward.negative_space import CheckFailed
-
-
-def _config():
-    return LSTMConfig(seed=1, batch_size=8, epochs=2, lr=1e-3, output_dir=Path("out"), run_name="r")
 
 
 def test_register_then_build_model_dispatches_correctly():
@@ -26,7 +21,9 @@ def test_register_then_build_model_dispatches_correctly():
     def _build(config):
         return ModelBundle(model=nn.Linear(1, 3), collate_fn=lambda batch: {})
 
-    config = _TestConfig(seed=1, batch_size=8, epochs=2, lr=1e-3, output_dir=Path("out"), run_name="r")
+    config = _TestConfig(
+        seed=1, batch_size=8, epochs=2, lr=1e-3, output_dir=Path("out"), run_name="r"
+    )
     bundle = build_model(config)
     assert isinstance(bundle, ModelBundle)
     assert isinstance(bundle.model, nn.Linear)
@@ -42,7 +39,9 @@ def test_build_model_raises_on_unknown_variant():
     class _UnregisteredConfig(TrainConfig):
         variant: ClassVar[str] = "never_registered"
 
-    config = _UnregisteredConfig(seed=1, batch_size=8, epochs=2, lr=1e-3, output_dir=Path("out"), run_name="r")
+    config = _UnregisteredConfig(
+        seed=1, batch_size=8, epochs=2, lr=1e-3, output_dir=Path("out"), run_name="r"
+    )
     with pytest.raises(CheckFailed, match="unknown variant"):
         build_model(config)
 

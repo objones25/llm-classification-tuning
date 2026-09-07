@@ -25,7 +25,7 @@ class _FakeWandb:
     def __init__(self) -> None:
         self.logged: list[dict] = []
 
-    def init(self, **kwargs):  # noqa: ARG002
+    def init(self, **kwargs):
         self.run = _FakeRun(self.logged)
         return self.run
 

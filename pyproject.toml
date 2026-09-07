@@ -67,7 +67,9 @@ addopts = [
     "--cov",
     "--cov-branch",
     "--cov-report=term-missing:skip-covered",
-    "--cov-fail-under=0",    # bootstrap: no tests yet. Ratchet this up as tests/ fills in.
+    # A real, currently-passing gate: the suite sits at 94%, so this is that rounded down to the
+    # nearest 5. Ratchet it up (never down) as coverage improves.
+    "--cov-fail-under=90",
     "-m", "not slow and not integration and not gpu",
 ]
 markers = [
@@ -108,5 +110,7 @@ parametrize-values-row-type = "tuple"
 raises-require-match-for = ["BaseException", "Exception", "ValueError", "OSError", "socket.error"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "ARG001"]
+# ARG001/ARG002/ARG005: trivial stand-in collate_fns, fake HfApi methods and monkeypatch
+# lambdas must match the real signature they replace, so their unused parameters are the point.
+"tests/**/*.py" = ["S101", "ARG001", "ARG002", "ARG005"]
 "conftest.py" = ["ARG001"]

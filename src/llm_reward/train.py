@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import sys
 from pathlib import Path
 
 import torch
@@ -16,7 +17,7 @@ from .data.dataset import PairwiseDataset
 from .data.pairwise import load_pairwise_examples, split_train_val
 from .evaluate import evaluate
 from .models.checkpoint import Checkpoint, ConfigMismatchError
-from .models.config import TrainConfig, load_config
+from .models.config import ConfigError, TrainConfig, load_config
 from .models.registry import ModelBundle, build_model
 from .negative_space import require
 
@@ -48,8 +49,13 @@ def _best_path(config: TrainConfig) -> Path:
 
 
 def _save_checkpoint(path: Path, checkpoint: Checkpoint) -> None:
+    """Write via a temp file + atomic rename. A pod dying mid-`torch.save` would otherwise
+    leave a truncated, unloadable `last.pt` — and `last.pt` is the only resume point there is.
+    `Path.replace` is atomic on POSIX, which covers both targets (macOS dev, Linux RunPod)."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint, path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(checkpoint, tmp_path)
+    tmp_path.replace(path)
 
 
 def _group_grad_norm(params) -> float:
@@ -85,6 +91,13 @@ def train(
         PairwiseDataset(val_examples), batch_size=config.batch_size, shuffle=False,
         collate_fn=bundle.collate_fn,
     )
+
+    # `collate_fn`'s output shape is a static property of the bundle, so one check on one batch
+    # settles it for the whole run -- the spec asks for this to fail before the training loop
+    # starts, not mid-epoch. Peeking a batch here is harmless: `train_loader` shuffles, so no
+    # epoch's actual iteration skips or repeats anything because of it.
+    first_batch = next(iter(train_loader))
+    require("labels" in first_batch, "collate_fn output is missing the required 'labels' key")
 
     optimizer = _make_optimizer(bundle, config)
     scheduler = _make_scheduler(optimizer, config, len(train_loader) * config.epochs)
@@ -137,7 +150,6 @@ def train(
             epoch_n = 0
 
             for batch in train_loader:
-                require("labels" in batch, "collate_fn output is missing the required 'labels' key")
                 batch = {k: v.to(device) for k, v in batch.items()}
                 labels = batch["labels"]
                 inputs = {k: v for k, v in batch.items() if k != "labels"}
@@ -212,6 +224,11 @@ def train(
                 epoch_log["system/gpu_mem_allocated_mb"] = (
                     torch.cuda.max_memory_allocated(device) / 1e6
                 )
+                # max_memory_allocated is cumulative since process start; reset it so the next
+                # epoch's number means "peak during THIS epoch" -- otherwise the metric is a
+                # monotonic high-water mark, not comparable to the MPS branch's instantaneous
+                # reading under the same key.
+                torch.cuda.reset_peak_memory_stats(device)
             elif device.type == "mps":
                 epoch_log["system/gpu_mem_allocated_mb"] = (
                     torch.mps.current_allocated_memory() / 1e6
@@ -245,11 +262,15 @@ def main() -> None:
     parser.add_argument("--train-csv", type=Path, default=Path("data/raw/train.csv"))
     args = parser.parse_args()
 
-    config = load_config(args.config)
-    bundle = build_model(config)
-    examples = load_pairwise_examples(args.train_csv)
-    train_examples, val_examples = split_train_val(examples, config.val_fraction, config.seed)
-    train(config, bundle, train_examples, val_examples, resume=args.resume)
+    try:
+        config = load_config(args.config)
+        bundle = build_model(config)
+        examples = load_pairwise_examples(args.train_csv)
+        train_examples, val_examples = split_train_val(examples, config.val_fraction, config.seed)
+        train(config, bundle, train_examples, val_examples, resume=args.resume)
+    except (ConfigError, ConfigMismatchError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

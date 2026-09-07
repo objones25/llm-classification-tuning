@@ -55,6 +55,19 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PYTHONHASHSEED", str(SEED))
 
 
+@pytest.fixture(autouse=True)
+def _restore_model_registry():
+    """Undo any `@register(...)` a test performed. Several tests register throwaway fake
+    variants; without this they leak into every later test in the session and break outright
+    under a re-run/re-collection plugin (`register` rejects a duplicate name)."""
+    from llm_reward.models.registry import _REGISTRY
+
+    snapshot = dict(_REGISTRY)
+    yield
+    _REGISTRY.clear()
+    _REGISTRY.update(snapshot)
+
+
 @pytest.fixture
 def tiny_pairwise_examples() -> list[PairwiseExample]:
     """Six hand-built records, two per label — the one shared fixture every track's tests build
@@ -65,7 +78,9 @@ def tiny_pairwise_examples() -> list[PairwiseExample]:
             id="2", prompt="Capital of France?",
             response_a="Paris is the capital.", response_b="I don't know.", label=0,
         ),
-        PairwiseExample(id="3", prompt="Say hi", response_a="hi", response_b="Hello there!", label=1),
+        PairwiseExample(
+            id="3", prompt="Say hi", response_a="hi", response_b="Hello there!", label=1,
+        ),
         PairwiseExample(
             id="4", prompt="Explain gravity",
             response_a="Things fall down.", response_b="Mass attracts mass.", label=1,
