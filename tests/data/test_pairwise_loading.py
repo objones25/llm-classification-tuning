@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from llm_reward.data.pairwise import load_pairwise_examples, load_test_examples, split_train_val
+from llm_reward.data.pairwise import (
+    _extract_text,
+    load_pairwise_examples,
+    load_test_examples,
+    split_train_val,
+)
 from llm_reward.negative_space import CheckFailed
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "tiny_train.csv"
@@ -75,6 +80,30 @@ def test_load_test_examples_raises_on_wrong_header(tmp_path):
     bad_csv.write_text("id,prompt\n")
     with pytest.raises(CheckFailed, match="expected columns"):
         load_test_examples(bad_csv)
+
+
+def test_extract_text_joins_a_real_style_json_double_quoted_list(recwarn):
+    result = _extract_text('["Say hi", "again"]')
+    assert result == "Say hi\nagain"
+    assert len(recwarn) == 0  # ast.literal_eval-first would warn on nothing here, but pin it
+
+
+def test_extract_text_handles_json_escaped_forward_slash_without_warning(recwarn):
+    # A real value from the competition data: JSON's \/ escape for a literal /. ast.literal_eval
+    # doesn't recognize \/ as an escape sequence and emits SyntaxWarning -- once per row, which
+    # crashed nothing but flooded stdout on a real training run.
+    result = _extract_text(r'["a slash: \/ here"]')
+    assert result == "a slash: / here"
+    assert len(recwarn) == 0
+
+
+def test_extract_text_falls_back_to_ast_literal_eval_for_single_quoted_list():
+    result = _extract_text("['Say hi', 'again']")
+    assert result == "Say hi\nagain"
+
+
+def test_extract_text_returns_raw_string_for_plain_non_list_text():
+    assert _extract_text("What is 2+2?") == "What is 2+2?"
 
 
 def test_split_train_val_rejects_out_of_range_fraction():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,10 +45,22 @@ class PairwiseExample:
 
 
 def _extract_text(value: str) -> str:
+    """Turn a Kaggle multi-turn field (a JSON-encoded list of strings) into one string.
+
+    The real data is genuinely JSON -- including JSON-only escapes like `\\/` for `/` -- so
+    json.loads is tried first; ast.literal_eval is a fallback for the single-quoted Python-literal
+    style some hand-built test fixtures use, since json.loads rejects single quotes outright.
+    Trying ast.literal_eval first would still "work" via Python's own string-literal grammar, but
+    it doesn't recognize `\\/` as an escape and warns (SyntaxWarning) on every real row that has
+    one -- json.loads has no such gap for the format the data actually uses.
+    """
     try:
-        parsed = ast.literal_eval(value)
-    except (ValueError, SyntaxError):
-        return value
+        parsed = json.loads(value)
+    except ValueError:
+        try:
+            parsed = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return value
     if isinstance(parsed, list):
         return "\n".join(str(turn) for turn in parsed)
     return value
