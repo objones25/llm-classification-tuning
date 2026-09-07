@@ -50,7 +50,7 @@ uv run python scripts/push_to_hub.py --checkpoint outputs/lstm_baseline/best.pt 
     --repo-id objones25/llm-reward-lstm-baseline
 ```
 
-`.env` (already present, loaded via `python-dotenv` at process entry only — never inside library
+`.env` (already present, loaded with `python-dotenv` at process entry only — never inside library
 code) holds `KAGGLE_API_TOKEN`, `HF_TOKEN`, `WANDB_API_KEY`. `KAGGLE_API_TOKEN` is kagglehub's
 modern single-token env var (highest priority in its credential discovery order); don't add
 `KAGGLE_USERNAME`/`KAGGLE_KEY` unless the token approach stops working.
@@ -61,43 +61,53 @@ modern single-token env var (highest priority in its credential discovery order)
 model variants share almost everything except model construction, so a shared package with one
 variation point avoids duplicating the data/train/eval/submit path three times (DRY, YAGNI).
 
-```
+```text
 src/llm_reward/
+  negative_space.py # require()/bounded()/check_shape()/check_finite() — fail-fast helpers used
+                    # everywhere instead of bare `assert`, which `python -O` strips silently
   data/
     download.py     # thin wrapper around kagglehub.competition_download — the only place that touches
                     # the network for data; everything downstream takes a local path
-    pairwise.py     # train.csv/test.csv -> (prompt, response_a, response_b, label) records;
-                    # owns tie handling and any prompt/response truncation policy
-    dataset.py      # torch Dataset/collate_fn over pairwise records, shared by all 3 variants
+    pairwise.py     # train.csv -> PairwiseExample records; owns tie handling, the train/val split,
+                    # and any prompt/response truncation policy
+    dataset.py      # torch Dataset over pairwise records, shared by all 3 variants
   models/
-    config.py       # dataclasses (one per variant) loaded from configs/*.yaml — YAML because RunPod
-                    # jobs and future W&B sweeps need file-based configs, not just CLI args
+    config.py       # TrainConfig + one frozen subclass per variant, loaded from configs/*.yaml
     registry.py     # name -> build_model(config) dispatch; the ONE place that knows about all
-                    # three variants — train.py/submit.py never branch on model type themselves
+                    # three variants — train.py never branches on model type itself
+    checkpoint.py   # Checkpoint dataclass + ConfigMismatchError, torch.save/load'd for resume
+    _common.py      # format_input(), shared by all three variants so their training text can't
+                    # silently diverge
+    _hf_common.py   # LogitsOnly wrapper + collate_fn shared by the two transformers-backed
+                    # variants only (sft_head.py, lora_head.py) — lstm_baseline.py doesn't use this
     lstm_baseline.py
     sft_head.py     # small HF model + classification head
     lora_head.py    # medium HF model + peft LoRA + classification head
   train.py          # single entrypoint for all variants: load config -> registry.build_model -> fit
   evaluate.py
-  submit.py         # writes submission.csv matching sample_submission.csv's schema exactly
 configs/
   lstm_baseline.yaml
   small_sft_head.yaml
   medium_lora.yaml
 scripts/
-  download_data.py
-  runpod_train.sh     # documents the expected pod environment (CUDA, uv) and SSH invocation
-  push_to_hub.py      # opt-in: push a reviewed checkpoint's weights (+ tokenizer, + model card) to
-                       # the HF Hub — the durable store, since /workspace doesn't survive pod deletion
+  push_to_hub.py    # opt-in: push a reviewed checkpoint's weights (+ tokenizer, + model card) to
+                    # the HF Hub — the durable store, since /workspace doesn't survive pod deletion
 ```
 
-**Model registry is the DRY seam.** `train.py`, `evaluate.py`, and `submit.py` are variant-agnostic;
-adding a fourth model idea means adding one `models/*.py` + one registry entry + one YAML config,
-never touching the data pipeline or the other two variants.
+Not built yet, deliberately (see the spec's stated non-goals): `submit.py` (writes
+`submission.csv` — needs a training loop to exist first, which it now does, but its own
+prediction-path design is a separate follow-up), `scripts/download_data.py`, and
+`scripts/runpod_train.sh`. Don't assume these exist — check before referencing them.
+
+**Model registry is the DRY seam.** `train.py` and `evaluate.py` are variant-agnostic today
+(`submit.py`, when it's built, is designed to be too); adding a fourth model idea means adding one
+`models/*.py` + one registry entry + one YAML config, never touching the data pipeline or the
+other two variants.
 
 **RunPod workflow is manual, not scripted.** You provision/start/stop the pod yourself (RunPod
 CLI/MCP or console); this repo only needs to run cleanly over SSH once `uv sync` has been run on the
-pod. `scripts/runpod_train.sh` documents that invocation — it is not a provisioning tool.
+pod. `scripts/runpod_train.sh`, once written, would document that invocation — for now, the
+expected environment is what's in the paragraphs below.
 
 **Target pod: `runpod-torch-v280` template (`runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404`,
 CUDA 12.8.1 / torch 2.8.0 / Ubuntu 24.04) on an RTX PRO 6000 (Blackwell, 96GB VRAM).** `torch` in
@@ -117,10 +127,10 @@ a `/workspace`-rooted checkout.
 **Model persistence is the Hugging Face Hub, opt-in, never automatic.** Since there's no separate
 Network Volume, a run's local checkpoint is gone once its pod is deleted. `scripts/push_to_hub.py`
 is a standalone script (never called from `train.py`) that, once you've reviewed a run's eval
-metrics and decided to keep it, reconstructs the model via `registry.build_model(checkpoint.config)`
+metrics and decided to keep it, reconstructs the model through `registry.build_model(checkpoint.config)`
 and pushes it to a private per-variant repo (`objones25/llm-reward-{variant}`): the LoRA variant
 pushes its adapter only (never `merge_and_unload()`'d — that would defeat the point of a small
-artifact), the SFT+head variant pushes full weights via `transformers`' native `push_to_hub`, and
+artifact), the SFT+head variant pushes full weights with `transformers`' native `push_to_hub`, and
 the LSTM baseline (a plain `nn.Module` with no Hub-native save format) falls back to
 `huggingface_hub.upload_file` with a raw `state_dict`. See
 `docs/superpowers/specs/2026-09-07-training-seams-design.md` (Section E) for the full contract.
@@ -151,7 +161,7 @@ the LSTM baseline (a plain `nn.Module` with no Hub-native save format) falls bac
   function.
 - Bound everything with a numeric limit and assert it: max sequence length before truncation, max
   retries on a Kaggle/HF download, max training steps — no unbounded `while True`.
-- Programmer errors (an impossible internal state — e.g. registry returns a model with the wrong
+- Programmer errors (an impossible internal state — for example, registry returns a model with the wrong
   output width) assert and crash. Operating errors (Kaggle download fails, HF Hub is unreachable,
   a checkpoint path doesn't exist) raise a typed exception and get handled at the call site — never
   conflate the two, and never swallow the operating-error case silently.
