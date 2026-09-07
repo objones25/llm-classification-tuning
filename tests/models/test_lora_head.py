@@ -101,3 +101,11 @@ def test_real_model_is_reachable_through_the_wrapper_for_push_to_hub_dispatch(tm
     from peft import PeftModel
 
     assert isinstance(bundle.model.hf_model, PeftModel)
+
+
+def test_gradient_checkpointing_enables_input_require_grads(tmp_path, monkeypatch):
+    monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+    monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
+
+    bundle = lora_head.build_model(_config(tmp_path, gradient_checkpointing=True))
+    assert bundle.model.hf_model.is_gradient_checkpointing

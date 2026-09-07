@@ -70,6 +70,14 @@ def build_model(config: LoRAConfig) -> ModelBundle:
     )
     peft_model = get_peft_model(base_model, lora_config)
 
+    if config.gradient_checkpointing:
+        peft_model.gradient_checkpointing_enable()
+        # LoRA always freezes the base, so this is always needed here (unlike sft_head.py, where
+        # it's conditional on freeze_backbone) — without it, gradient checkpointing recomputes the
+        # frozen embedding layer's forward pass with no grad-tracking input, and backward silently
+        # produces no gradient for the adapters at all.
+        peft_model.enable_input_require_grads()
+
     param_groups = None
     if config.head_lr is not None:
         head_params = [
