@@ -231,6 +231,31 @@ declared in each variant's own file, `registry.py` never changes again after thi
 only shared touch point is the three-line `models/__init__.py` import list, where three independent
 one-line additions merge trivially.
 
+**HF-backed variants must unwrap `.logits` before returning from `forward`.** Verified locally:
+`transformers`/`peft` models return a `ModelOutput` object (e.g. `SequenceClassifierOutputWithPast`)
+from `forward()`, not a bare tensor — calling `bundle.model(**inputs)` on a raw
+`AutoModelForSequenceClassification`/`PeftModel` would silently break the "forward returns a
+`[B, 3]` tensor" contract above. `sft_head.py` and `lora_head.py` must each wrap their model in a
+small adapter before constructing `ModelBundle`:
+
+```python
+class _LogitsOnly(nn.Module):
+    """Unwraps a HF ModelOutput so forward(**inputs) returns a bare logits tensor,
+    matching the ModelBundle contract instead of transformers'/peft's wrapper object."""
+
+    def __init__(self, hf_model: nn.Module) -> None:
+        super().__init__()
+        self.hf_model = hf_model  # exposes the real model for Section E's isinstance dispatch
+
+    def forward(self, **inputs: torch.Tensor) -> torch.Tensor:
+        return self.hf_model(**inputs).logits
+```
+
+Duplicated in both files rather than added to `registry.py` — same reasoning as `_format_input`
+below: registry.py is meant to be stable after this design lands, and the wrapper is 6 lines.
+Section E's capability dispatch checks `getattr(model, "hf_model", model)` first, so an
+`isinstance` check still sees the real `PreTrainedModel`/`PeftModel` underneath the wrapper.
+
 **Uniform loss**, computed in `train.py`, never inside a model file:
 
 ```python
@@ -379,11 +404,14 @@ def push_to_hub(checkpoint_path: Path, repo_id: str, private: bool = True) -> st
 - **Reconstruction reuses the existing registry seam** — `build_model(checkpoint.config)` gives
   back the right architecture; no new hook is added to `models/registry.py` or `ModelBundle`.
 - **Push dispatch is by model capability, not by variant name** — consistent with the "plain
-  `nn.Module`, no variant branching" decision in Section B:
-  - `isinstance(model, peft.PeftModel)` → its own `push_to_hub()` uploads the **adapter only**
-    (a few MB-tens of MB, not the merged base-model-sized weights — `merge_and_unload()` is
-    explicitly not used, since it would defeat LoRA's small-artifact point).
-  - `isinstance(model, transformers.PreTrainedModel)` (the SFT+head variant) → same method,
+  `nn.Module`, no variant branching" decision in Section B. First unwrap:
+  `real_model = getattr(bundle.model, "hf_model", bundle.model)` — undoes the `_LogitsOnly`
+  wrapper from Section B for the two HF-backed variants; the LSTM's model has no `hf_model`
+  attribute, so `getattr` falls back to itself unchanged. Then:
+  - `isinstance(real_model, peft.PeftModel)` → its own `push_to_hub()` uploads the **adapter
+    only** (a few MB-tens of MB, not the merged base-model-sized weights — `merge_and_unload()`
+    is explicitly not used, since it would defeat LoRA's small-artifact point).
+  - `isinstance(real_model, transformers.PreTrainedModel)` (the SFT+head variant) → same method,
     uploads full weights.
   - Otherwise (the LSTM baseline — a plain custom `nn.Module` with no Hub-native save format) →
     `huggingface_hub.upload_file` with a plain `torch.save`'d state dict.
