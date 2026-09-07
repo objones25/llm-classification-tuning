@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import zlib
+
 import torch
 from torch import nn
 
@@ -17,8 +19,14 @@ def _format_input(example: PairwiseExample) -> str:
 
 
 def _hash_tokenize(text: str, vocab_size: int, max_seq_len: int) -> list[int]:
+    # zlib.crc32 (not the builtin hash()) so token ids are stable across process runs --
+    # str hashing is randomized per-process (PYTHONHASHSEED / SipHash) unless the seed is
+    # fixed before interpreter startup, which conftest's monkeypatch can't do retroactively.
     tokens = text.split()[:max_seq_len]
-    ids = [hash(tok) % (vocab_size - 1) + 1 for tok in tokens]  # 0 reserved for padding
+    ids = [
+        zlib.crc32(tok.encode("utf-8")) % (vocab_size - 1) + 1  # 0 reserved for padding
+        for tok in tokens
+    ]
     ids += [0] * (max_seq_len - len(ids))
     return ids
 
