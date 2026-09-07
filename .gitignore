@@ -21,7 +21,7 @@ coverage.xml
 htmlcov/
 
 # Kaggle competition data (downloaded via kagglehub, not committed)
-data/
+/data/
 
 # Training artifacts
 checkpoints/
