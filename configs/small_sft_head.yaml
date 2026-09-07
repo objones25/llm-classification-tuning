@@ -1,0 +1,10 @@
+variant: small_sft_head
+seed: 20260907
+batch_size: 16
+epochs: 3
+lr: 0.00002
+output_dir: outputs/small_sft_head
+run_name: small-sft-head-v1
+hf_model_name: Qwen/Qwen2.5-0.5B-Instruct
+max_seq_len: 1024
+head_lr: 0.001
