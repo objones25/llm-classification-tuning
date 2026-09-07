@@ -1,0 +1,4 @@
+id,model_a,model_b,prompt,response_a,response_b,winner_model_a,winner_model_b,winner_model_tie
+1,gpt-x,claude-y,"What is 2+2?","4","Four",1,0,0
+2,gpt-x,claude-y,"['Say hi', 'again']","['hi', 'hi again']","['hello', 'hello again']",0,1,0
+3,gpt-x,claude-y,"Pick a number","7","7",0,0,1
