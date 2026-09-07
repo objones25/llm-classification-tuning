@@ -1,7 +1,6 @@
 from pathlib import Path
 
 import pytest
-import torch
 from torch import nn
 
 from llm_reward.models.config import LSTMConfig
