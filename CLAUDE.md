@@ -81,6 +81,8 @@ configs/
 scripts/
   download_data.py
   runpod_train.sh     # documents the expected pod environment (CUDA, uv) and SSH invocation
+  push_to_hub.py      # opt-in: push a reviewed checkpoint's weights (+ tokenizer, + model card) to
+                       # the HF Hub — the durable store, since /workspace doesn't survive pod deletion
 ```
 
 **Model registry is the DRY seam.** `train.py`, `evaluate.py`, and `submit.py` are variant-agnostic;
@@ -105,6 +107,17 @@ choice). Everything that needs to survive a stop/start — the repo clone, the `
 model cache, the kagglehub download, and checkpoints — must live under `/workspace`, not the
 container disk: point `HF_HOME` and the kagglehub cache dir there, and run `uv sync`/`uv run` from
 a `/workspace`-rooted checkout.
+
+**Model persistence is the Hugging Face Hub, opt-in, never automatic.** Since there's no separate
+Network Volume, a run's local checkpoint is gone once its pod is deleted. `scripts/push_to_hub.py`
+is a standalone script (never called from `train.py`) that, once you've reviewed a run's eval
+metrics and decided to keep it, reconstructs the model via `registry.build_model(checkpoint.config)`
+and pushes it to a private per-variant repo (`objones25/llm-reward-{variant}`): the LoRA variant
+pushes its adapter only (never `merge_and_unload()`'d — that would defeat the point of a small
+artifact), the SFT+head variant pushes full weights via `transformers`' native `push_to_hub`, and
+the LSTM baseline (a plain `nn.Module` with no Hub-native save format) falls back to
+`huggingface_hub.upload_file` with a raw `state_dict`. See
+`docs/superpowers/specs/2026-09-07-training-seams-design.md` (Section E) for the full contract.
 
 ### Testing (pytest, per the pytest-expert skill — apply its rules directly, don't re-derive them)
 

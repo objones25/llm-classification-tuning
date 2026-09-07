@@ -17,8 +17,9 @@ Nothing in this repository has been implemented yet. This is pure interface desi
 ## Scope
 
 In scope: the seam between `data/` and `models/` (tokenization ownership), the seam between
-`models/` and `train.py`/`evaluate.py` (the model + config + registry contract), and the
-checkpoint/resume/W&B contract inside the training loop itself.
+`models/` and `train.py`/`evaluate.py` (the model + config + registry contract), the
+checkpoint/resume/W&B contract inside the training loop itself, and (added 2026-09-07) the
+opt-in Hugging Face Hub upload step that persists a finished run beyond the RunPod pod's lifecycle.
 
 Out of scope (deliberately, YAGNI): `submit.py`'s prediction interface (writing
 `submission.csv`) is mentioned only where it touches `evaluate.py`; its own contract is a smaller,
@@ -315,13 +316,59 @@ implied by the interfaces:
   `PairwiseExample`s built in-test — no real dataset, no real model, no network. This suite proves
   the checkpoint/resume/W&B-resume state machine independent of every other component.
 
+## E. Model persistence: Hugging Face Hub upload
+
+Added 2026-09-07, as a bounded addendum — none of Sections A-D change. RunPod's `/workspace` is
+only a 50GB persistent volume shared across all three variants (Section C decisions), with no
+separate Network Volume (`CLAUDE.md`'s RunPod section); pushing a finished run to the HF Hub is the
+actual durable long-term store, not pod-local disk.
+
+**Trigger**: a separate, opt-in `scripts/push_to_hub.py`, never called from `train.py`. Every
+experimental run gets checkpointed locally regardless of quality (Section C); only a run you've
+reviewed and decided is worth keeping gets pushed. This keeps `train.py`'s loop fully local and
+network-free except for the (already-existing) W&B logging calls.
+
+```python
+def push_to_hub(checkpoint_path: Path, repo_id: str, private: bool = True) -> str:
+    """Loads a Checkpoint, reconstructs the model via build_model(checkpoint.config), loads its
+    state dict, pushes the model (+ tokenizer, for HF-backed variants) and a model card. Returns
+    the resulting commit URL."""
+```
+
+- **Reconstruction reuses the existing registry seam** — `build_model(checkpoint.config)` gives
+  back the right architecture; no new hook is added to `models/registry.py` or `ModelBundle`.
+- **Push dispatch is by model capability, not by variant name** — consistent with the "plain
+  `nn.Module`, no variant branching" decision in Section B:
+  - `isinstance(model, peft.PeftModel)` → its own `push_to_hub()` uploads the **adapter only**
+    (a few MB-tens of MB, not the merged base-model-sized weights — `merge_and_unload()` is
+    explicitly not used, since it would defeat LoRA's small-artifact point).
+  - `isinstance(model, transformers.PreTrainedModel)` (the SFT+head variant) → same method,
+    uploads full weights.
+  - Otherwise (the LSTM baseline — a plain custom `nn.Module` with no Hub-native save format) →
+    `huggingface_hub.upload_file` with a plain `torch.save`'d state dict.
+- **Tokenizer**: for variants with `config.hf_model_name` (SFT+head, LoRA), also push
+  `AutoTokenizer.from_pretrained(config.hf_model_name)` — derived fresh from the config already in
+  the checkpoint, not stored anywhere new. The LSTM baseline has no HF tokenizer to push.
+- **Model card**: a generated `README.md` embedding `checkpoint.config` (the exact hyperparameters
+  that produced this weight file) and `checkpoint.best_val_metric` — the same reproducibility
+  reasoning as storing `config` inside `Checkpoint` itself (Section C). This is also where the
+  privacy decision below earns its keep: a model card's example section is exactly where profane or
+  vulgar competition text could otherwise leak into a public artifact.
+- **Repos**: one private repo per variant — `objones25/llm-reward-lstm-baseline`,
+  `objones25/llm-reward-small-sft-head`, `objones25/llm-reward-medium-lora`. Each `push_to_hub`
+  call is a new commit on that repo; HF's own commit history is the run history, so no separate
+  versioning scheme is needed. Private by default (`private=True`), overridable via a CLI flag if a
+  variant is ever deliberately made public later.
+
 ## Non-goals (explicit, so a future session doesn't relitigate them)
 
 - Step-level / mid-epoch resume.
-- A separate RunPod Network Volume (already decided in `CLAUDE.md`: template's `/workspace` only).
+- A separate RunPod Network Volume (already decided in `CLAUDE.md`: template's `/workspace` only —
+  the Hub upload in Section E is what replaces the need for one).
 - A richer model `Protocol` beyond plain `nn.Module` (no `compute_loss`/`parameters_to_optimize`).
 - Per-epoch checkpoint retention (only `last.pt` + `best.pt` exist).
 - `submit.py`'s own prediction/inference contract — a follow-up design once training exists.
+- Automatic/every-run Hub uploads, and merged (non-adapter) uploads for the LoRA variant.
 
 ## Open questions
 
