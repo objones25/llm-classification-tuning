@@ -14,9 +14,11 @@ reviewed run to the Hub since the RunPod pod's local disk does not survive pod d
 **Tech Stack:** Python 3.13, uv, PyTorch 2.8.0, transformers, peft, huggingface_hub, PyYAML,
 wandb, pytest (strict mode, already configured in `pyproject.toml`).
 
-**Spec:** `docs/superpowers/specs/2026-09-07-training-seams-design.md` (read Sections A-E plus
-the two 2026-09-07 amendments — the `kw_only=True` dataclass fix and the `_LogitsOnly` wrapper —
-before starting any task; this plan assumes both).
+**Spec:** `docs/superpowers/specs/2026-09-07-training-seams-design.md` (read Sections A-E plus all
+2026-09-07 amendments — the `kw_only=True` dataclass fix, the `_LogitsOnly` wrapper, and the
+device-placement/mixed-precision/W&B-metrics amendment added after a pytorch-skill review of this
+plan, before any task in this plan existed in its current form — before starting any task; this
+plan assumes all of them).
 
 ## Global Constraints
 
@@ -37,6 +39,15 @@ before starting any task; this plan assumes both).
 - Model choices (already decided, not open for reinterpretation): small variant =
   `Qwen/Qwen2.5-0.5B-Instruct`, medium variant = `Qwen/Qwen2.5-7B-Instruct`. Both are ungated on
   the Hub — no HF license click-through needed before `HF_TOKEN` can pull them.
+- `train.py` (Task 15) resolves `device` once via `torch.accelerator.current_accelerator(check_available=True)
+  or torch.device("cpu")`, moves `bundle.model.to(device)` once, and moves every batch tensor to
+  `device` before the forward pass. This is not optional or deferrable — without it, training
+  silently runs on CPU regardless of what hardware it's launched on (verified against the pytorch
+  skill's `05-data-training-loop.md`).
+- `wandb.init(...)`'s return value (the `run` object) is held and used for every later call —
+  `run.log(...)`, `run.id`, `run.define_metric(...)` — never the bare `wandb.*` module-level form
+  (verified against wandb's own docs and the observability-expert skill's `WB004` rule). A test
+  double standing in for the `wandb` module must return an object supporting this same shape.
 - Every task's tests run with `uv run pytest <path> -v` and must pass before the task's commit.
 
 ---
@@ -521,6 +532,18 @@ def test_lora_config_constructs_without_typeerror():
     assert config.target_modules == ("q_proj", "v_proj")
 
 
+def test_mixed_precision_defaults_to_no():
+    config = LSTMConfig(**_base_kwargs())
+    assert config.mixed_precision == "no"
+
+
+def test_gradient_checkpointing_defaults_to_false_on_hf_backed_variants():
+    sft = SFTHeadConfig(**_base_kwargs(), hf_model_name="x", max_seq_len=8)
+    lora = LoRAConfig(**_base_kwargs(), hf_model_name="x", max_seq_len=8)
+    assert sft.gradient_checkpointing is False
+    assert lora.gradient_checkpointing is False
+
+
 def test_configs_are_frozen():
     config = LSTMConfig(**_base_kwargs())
     with pytest.raises(AttributeError):
@@ -609,6 +632,7 @@ class TrainConfig:
     warmup_ratio: float = 0.0
     lr_scheduler: Literal["constant", "linear", "cosine"] = "linear"
     class_weights: tuple[float, float, float] | None = None
+    mixed_precision: Literal["no", "bf16"] = "no"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -628,6 +652,7 @@ class SFTHeadConfig(TrainConfig):
     max_seq_len: int
     freeze_backbone: bool = False
     head_lr: float | None = None
+    gradient_checkpointing: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -640,6 +665,7 @@ class LoRAConfig(TrainConfig):
     lora_dropout: float = 0.05
     target_modules: tuple[str, ...] = ("q_proj", "v_proj")
     head_lr: float | None = None
+    gradient_checkpointing: bool = False
 
 
 _VARIANTS: dict[str, type[TrainConfig]] = {
@@ -849,7 +875,7 @@ git commit -m "feat: add ModelBundle and the self-registering model registry"
 
 **Interfaces:**
 - Consumes: `TrainConfig` (Task 4).
-- Produces: `Checkpoint(epoch, model_state, optimizer_state, scheduler_state, best_val_metric, config, wandb_run_id)`,
+- Produces: `Checkpoint(epoch, global_step, model_state, optimizer_state, scheduler_state, best_val_metric, config, wandb_run_id)`,
   `ConfigMismatchError(Exception)`.
 
 - [ ] **Step 1: Write the failing test**
@@ -871,6 +897,7 @@ def _config():
 def test_checkpoint_round_trips_through_torch_save(tmp_path):
     checkpoint = Checkpoint(
         epoch=0,
+        global_step=42,
         model_state={"weight": torch.zeros(2)},
         optimizer_state={},
         scheduler_state=None,
@@ -880,9 +907,10 @@ def test_checkpoint_round_trips_through_torch_save(tmp_path):
     )
     path = tmp_path / "last.pt"
     torch.save(checkpoint, path)
-    loaded: Checkpoint = torch.load(path, weights_only=False)
+    loaded: Checkpoint = torch.load(path, weights_only=False, map_location="cpu")
 
     assert loaded.epoch == 0
+    assert loaded.global_step == 42
     assert loaded.config == _config()
     assert loaded.wandb_run_id == "run-123"
     torch.testing.assert_close(loaded.model_state["weight"], torch.zeros(2))
@@ -912,6 +940,8 @@ from .config import TrainConfig
 @dataclass
 class Checkpoint:
     epoch: int  # last COMPLETED epoch, 0-indexed
+    global_step: int  # total training steps so far, across all epochs — carried across resume so
+                       # the W&B step x-axis doesn't reset to 0 on a new process
     model_state: dict
     optimizer_state: dict
     scheduler_state: dict | None
@@ -1590,6 +1620,14 @@ def test_head_lr_none_leaves_param_groups_unset(tmp_path, monkeypatch):
     assert bundle.param_groups is None
 
 
+def test_gradient_checkpointing_enables_input_require_grads_when_backbone_frozen(tmp_path, monkeypatch):
+    monkeypatch.setattr(sft_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+    monkeypatch.setattr(sft_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
+
+    bundle = sft_head.build_model(_config(tmp_path, gradient_checkpointing=True, freeze_backbone=True))
+    assert bundle.model.hf_model.is_gradient_checkpointing
+
+
 def test_real_model_is_reachable_through_the_wrapper_for_push_to_hub_dispatch(tmp_path, monkeypatch):
     monkeypatch.setattr(sft_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
     monkeypatch.setattr(sft_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
@@ -1691,6 +1729,14 @@ def build_model(config: SFTHeadConfig) -> ModelBundle:
             if not name.startswith("score"):
                 param.requires_grad = False
 
+    if config.gradient_checkpointing:
+        hf_model.gradient_checkpointing_enable()
+        if config.freeze_backbone:
+            # Without this, gradient checkpointing recomputes the frozen embedding layer's
+            # forward pass with no grad-tracking input, and backward silently produces no
+            # gradient for anything downstream. Only needed when something upstream is frozen.
+            hf_model.enable_input_require_grads()
+
     param_groups = None
     if config.head_lr is not None:
         head_params = [p for n, p in hf_model.named_parameters() if p.requires_grad and n.startswith("score")]
@@ -1718,6 +1764,7 @@ run_name: small-sft-head-v1
 hf_model_name: Qwen/Qwen2.5-0.5B-Instruct
 max_seq_len: 1024
 head_lr: 0.001
+mixed_precision: bf16
 ```
 
 ```python
@@ -1728,7 +1775,7 @@ from . import sft_head  # noqa: F401
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/models/test_sft_head.py -v`
-Expected: PASS (6 tests). The integration test needs network on first run:
+Expected: PASS (7 tests). The integration test needs network on first run:
 `uv run pytest -m integration tests/integration/test_sft_head_integration.py -v`.
 
 - [ ] **Step 5: Commit**
@@ -1862,6 +1909,14 @@ def test_head_lr_splits_adapter_and_head_into_two_groups(tmp_path, monkeypatch):
     assert bundle.param_groups[1]["lr"] == 1e-2
 
 
+def test_gradient_checkpointing_enables_input_require_grads(tmp_path, monkeypatch):
+    monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
+    monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
+
+    bundle = lora_head.build_model(_config(tmp_path, gradient_checkpointing=True))
+    assert bundle.model.hf_model.is_gradient_checkpointing
+
+
 def test_real_model_is_reachable_through_the_wrapper_for_push_to_hub_dispatch(tmp_path, monkeypatch):
     monkeypatch.setattr(lora_head.AutoModelForSequenceClassification, "from_pretrained", _tiny_qwen2_model)
     monkeypatch.setattr(lora_head.AutoTokenizer, "from_pretrained", lambda name: _FakeTokenizer())
@@ -1970,6 +2025,14 @@ def build_model(config: LoRAConfig) -> ModelBundle:
     )
     peft_model = get_peft_model(base_model, lora_config)
 
+    if config.gradient_checkpointing:
+        peft_model.gradient_checkpointing_enable()
+        # LoRA always freezes the base, so this is always needed here (unlike sft_head.py, where
+        # it's conditional on freeze_backbone) — without it, gradient checkpointing recomputes the
+        # frozen embedding layer's forward pass with no grad-tracking input, and backward silently
+        # produces no gradient for the adapters at all.
+        peft_model.enable_input_require_grads()
+
     param_groups = None
     if config.head_lr is not None:
         head_params = [
@@ -2002,6 +2065,8 @@ lora_rank: 16
 lora_alpha: 32
 lora_dropout: 0.05
 head_lr: 0.001
+mixed_precision: bf16
+gradient_checkpointing: true
 ```
 
 ```python
@@ -2012,7 +2077,7 @@ from . import lora_head  # noqa: F401
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/models/test_lora_head.py -v`
-Expected: PASS (6 tests). Integration test needs network on first run.
+Expected: PASS (7 tests). Integration test needs network on first run.
 
 - [ ] **Step 5: Commit**
 
@@ -2034,14 +2099,19 @@ git commit -m "feat: add medium SFT + LoRA model (Qwen2.5-7B-Instruct)"
 
 **Interfaces:**
 - Consumes: `require`.
-- Produces: `EvalMetrics(loss, accuracy, n_examples)`, `evaluate(model, loader) -> EvalMetrics`.
+- Produces: `EvalMetrics(loss, accuracy, n_examples, confusion_matrix, per_class_precision,
+  per_class_recall, per_class_f1, macro_f1)`, `evaluate(model, loader, device) -> EvalMetrics`.
+
+**Design note**: every classification metric below is derived from one 3x3 confusion-matrix count
+(`confusion[true_label][predicted_label]`), never accumulated separately — one place a counting
+bug could hide, not five. `device` is threaded through (not resolved here) because `train.py`
+(Task 15) resolves it once and moves the model there; `evaluate()` only needs to move each batch
+to match.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # tests/test_evaluate.py
-from pathlib import Path
-
 import pytest
 import torch
 from torch import nn
@@ -2049,6 +2119,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from llm_reward.evaluate import EvalMetrics, evaluate
 from llm_reward.negative_space import CheckFailed
+
+CPU = torch.device("cpu")
 
 
 class _FixedBatchDataset(Dataset):
@@ -2062,37 +2134,82 @@ class _FixedBatchDataset(Dataset):
         return idx
 
 
-def _perfect_classifier_loader(labels: list[int]) -> DataLoader:
-    """A DataLoader whose collate_fn hands back features engineered so a fixed linear model
-    scores the correct class perfectly, and the wrong ones badly."""
+class _IdentityOnFeatures(nn.Module):
+    """Returns the pre-baked 'features' batch as-is. NOT nn.Identity(): its forward's parameter
+    is named 'input', so calling it as model(features=...) — the actual ModelBundle contract,
+    forward(**inputs) — raises TypeError. This class's parameter is named to match."""
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return features
+
+
+def _loader(logits_per_example: list[list[float]], labels: list[int]) -> DataLoader:
+    """A DataLoader whose collate_fn hands back pre-baked logits (as 'features') and labels, so
+    tests assert exact confusion-matrix-derived metrics without training anything."""
 
     def collate_fn(indices):
+        features = torch.tensor([logits_per_example[i] for i in indices], dtype=torch.float32)
         batch_labels = torch.tensor([labels[i] for i in indices], dtype=torch.long)
-        features = torch.nn.functional.one_hot(batch_labels, num_classes=3).float() * 10.0
         return {"features": features, "labels": batch_labels}
 
     return DataLoader(_FixedBatchDataset(len(labels)), batch_size=2, collate_fn=collate_fn)
 
 
+def _one_hot_logit(predicted_class: int) -> list[float]:
+    logit = [0.0, 0.0, 0.0]
+    logit[predicted_class] = 10.0
+    return logit
+
+
 def test_evaluate_reports_perfect_accuracy_for_a_perfect_classifier():
-    model = nn.Identity()
-    loader = _perfect_classifier_loader([0, 1, 2, 0])
-    metrics = evaluate(model, loader)
+    labels = [0, 1, 2, 0]
+    loader = _loader([_one_hot_logit(label) for label in labels], labels)
+    metrics = evaluate(_IdentityOnFeatures(), loader, CPU)
     assert isinstance(metrics, EvalMetrics)
     assert metrics.accuracy == pytest.approx(1.0)
     assert metrics.n_examples == 4
+    assert metrics.macro_f1 == pytest.approx(1.0)
+
+
+def test_evaluate_computes_confusion_matrix_and_per_class_metrics_for_imperfect_predictions():
+    # true labels: 0, 0, 1, 1, 2, 2 -- predicted: 0, 1, 1, 1, 2, 0
+    labels = [0, 0, 1, 1, 2, 2]
+    predictions = [0, 1, 1, 1, 2, 0]
+    loader = _loader([_one_hot_logit(p) for p in predictions], labels)
+
+    metrics = evaluate(_IdentityOnFeatures(), loader, CPU)
+
+    assert metrics.confusion_matrix == ((1, 1, 0), (0, 2, 0), (1, 0, 1))
+    assert metrics.accuracy == pytest.approx(4 / 6)
+    assert metrics.per_class_precision == pytest.approx((0.5, 2 / 3, 1.0))
+    assert metrics.per_class_recall == pytest.approx((0.5, 1.0, 0.5))
+    assert metrics.per_class_f1 == pytest.approx((0.5, 0.8, 2 / 3))
+    assert metrics.macro_f1 == pytest.approx((0.5 + 0.8 + 2 / 3) / 3)
+
+
+def test_evaluate_guards_against_a_class_absent_from_true_and_predicted_labels():
+    # class 2 never appears as a true label or a prediction -- row/column sums are both zero.
+    labels = [0, 1]
+    predictions = [0, 1]
+    loader = _loader([_one_hot_logit(p) for p in predictions], labels)
+
+    metrics = evaluate(_IdentityOnFeatures(), loader, CPU)
+
+    assert metrics.per_class_precision[2] == 0.0
+    assert metrics.per_class_recall[2] == 0.0
+    assert metrics.per_class_f1[2] == 0.0
 
 
 def test_evaluate_rejects_an_empty_loader():
     loader = DataLoader(_FixedBatchDataset(0), batch_size=2, collate_fn=lambda x: x)
     with pytest.raises(CheckFailed, match="empty"):
-        evaluate(nn.Identity(), loader)
+        evaluate(_IdentityOnFeatures(), loader, CPU)
 
 
 def test_evaluate_puts_the_model_in_eval_mode():
     model = nn.Dropout(p=0.9)  # in train() mode this would zero ~90% of activations randomly
-    loader = _perfect_classifier_loader([0, 1])
-    evaluate(model, loader)
+    loader = _loader([[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]], [0, 1])
+    evaluate(model, loader, CPU)
     assert not model.training
 ```
 
@@ -2121,41 +2238,67 @@ class EvalMetrics:
     loss: float
     accuracy: float
     n_examples: int
+    confusion_matrix: tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]
+    per_class_precision: tuple[float, float, float]
+    per_class_recall: tuple[float, float, float]
+    per_class_f1: tuple[float, float, float]
+    macro_f1: float
 
 
-def evaluate(model: nn.Module, loader: DataLoader) -> EvalMetrics:
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> EvalMetrics:
     require(len(loader) > 0, "evaluate() received an empty DataLoader")
     model.eval()
     total_loss = 0.0
-    total_correct = 0
     total_examples = 0
+    confusion = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
     with torch.no_grad():
         for batch in loader:
+            batch = {k: v.to(device) for k, v in batch.items()}
             labels = batch["labels"]
             inputs = {k: v for k, v in batch.items() if k != "labels"}
             logits = model(**inputs)
             loss = torch.nn.functional.cross_entropy(logits, labels, reduction="sum")
             total_loss += loss.item()
-            total_correct += (logits.argmax(dim=-1) == labels).sum().item()
             total_examples += labels.shape[0]
+            for true_label, pred_label in zip(labels.tolist(), logits.argmax(dim=-1).tolist()):
+                confusion[true_label][pred_label] += 1
     require(total_examples > 0, "evaluate() processed zero examples")
+
+    correct = sum(confusion[c][c] for c in range(3))
+    precision, recall, f1 = [], [], []
+    for c in range(3):
+        true_positive = confusion[c][c]
+        predicted_count = sum(confusion[i][c] for i in range(3))
+        actual_count = sum(confusion[c])
+        p = true_positive / predicted_count if predicted_count > 0 else 0.0
+        r = true_positive / actual_count if actual_count > 0 else 0.0
+        f = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        precision.append(p)
+        recall.append(r)
+        f1.append(f)
+
     return EvalMetrics(
         loss=total_loss / total_examples,
-        accuracy=total_correct / total_examples,
+        accuracy=correct / total_examples,
         n_examples=total_examples,
+        confusion_matrix=(tuple(confusion[0]), tuple(confusion[1]), tuple(confusion[2])),
+        per_class_precision=tuple(precision),
+        per_class_recall=tuple(recall),
+        per_class_f1=tuple(f1),
+        macro_f1=sum(f1) / 3,
     )
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_evaluate.py -v`
-Expected: PASS (3 tests)
+Expected: PASS (5 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/llm_reward/evaluate.py tests/test_evaluate.py
-git commit -m "feat: add evaluate() and EvalMetrics"
+git commit -m "feat: add evaluate() with confusion-matrix-derived per-class precision/recall/F1"
 ```
 
 ---
@@ -2309,13 +2452,13 @@ def test_last_and_best_paths_are_under_output_dir(tmp_path):
 def test_save_checkpoint_creates_parent_directories(tmp_path):
     config = _lstm_config(tmp_path / "nested" / "dir")
     checkpoint = Checkpoint(
-        epoch=0, model_state={}, optimizer_state={}, scheduler_state=None,
+        epoch=0, global_step=0, model_state={}, optimizer_state={}, scheduler_state=None,
         best_val_metric=0.0, config=config, wandb_run_id="r",
     )
     path = _last_path(config)
     _save_checkpoint(path, checkpoint)
     assert path.exists()
-    loaded: Checkpoint = torch.load(path, weights_only=False)
+    loaded: Checkpoint = torch.load(path, weights_only=False, map_location="cpu")
     assert loaded.epoch == 0
 
 
@@ -2324,7 +2467,7 @@ def test_exactly_two_checkpoint_files_exist_regardless_of_epoch_count(tmp_path):
     config = _lstm_config(tmp_path)
     for epoch in range(5):
         checkpoint = Checkpoint(
-            epoch=epoch, model_state={}, optimizer_state={}, scheduler_state=None,
+            epoch=epoch, global_step=epoch * 4, model_state={}, optimizer_state={}, scheduler_state=None,
             best_val_metric=float(epoch), config=config, wandb_run_id="r",
         )
         _save_checkpoint(_last_path(config), checkpoint)
@@ -2400,8 +2543,25 @@ from llm_reward.train import train
 
 
 class _FakeRun:
-    def __init__(self, run_id: str) -> None:
+    """Stands in for the object wandb.init(...) returns. train.py holds this object and calls
+    .log(...)/.id/.define_metric(...) on it, and (if used as a context manager) .__enter__/
+    .__exit__ -- never module-level wandb.log(...), which targets an implicit global run."""
+
+    def __init__(self, run_id: str, logged: list[dict]) -> None:
         self.id = run_id
+        self._logged = logged
+
+    def log(self, data: dict) -> None:
+        self._logged.append(data)
+
+    def define_metric(self, *args, **kwargs) -> None:
+        pass
+
+    def __enter__(self) -> "_FakeRun":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        pass
 
 
 class _FakeWandb:
@@ -2410,16 +2570,13 @@ class _FakeWandb:
         self.run: _FakeRun | None = None
         self._next_id = 0
 
-    def init(self, *, project, id=None, resume=None, config=None):
-        self.run = _FakeRun(id or f"fake-run-{self._next_id}")
+    def init(self, *, project, config=None, id=None, resume=None):
+        self.run = _FakeRun(id or f"fake-run-{self._next_id}", self.logged)
         self._next_id += 1
         return self.run
 
-    def log(self, data: dict) -> None:
-        self.logged.append(data)
-
-    def finish(self) -> None:
-        pass
+    def Table(self, *, columns, data):
+        return {"columns": columns, "data": data}
 
 
 def _fake_bundle(with_param_groups: bool = False):
@@ -2452,6 +2609,11 @@ def _examples(n: int) -> list[PairwiseExample]:
     ]
 
 
+def _epoch_entries(logged: list[dict]) -> list[dict]:
+    """Per-epoch summary entries (they carry an 'epoch' key); per-step entries don't."""
+    return [entry for entry in logged if "epoch" in entry]
+
+
 def test_train_runs_and_writes_both_checkpoint_files(tmp_path, monkeypatch):
     import llm_reward.train as train_module
 
@@ -2465,18 +2627,65 @@ def test_train_runs_and_writes_both_checkpoint_files(tmp_path, monkeypatch):
     assert (tmp_path / "best.pt").exists()
 
 
-def test_train_logs_epochs_zero_and_one_on_a_fresh_run(tmp_path, monkeypatch):
+def test_train_moves_model_and_batches_to_the_resolved_device(tmp_path, monkeypatch):
+    import llm_reward.train as train_module
+
+    monkeypatch.setattr(train_module, "wandb", _FakeWandb())
+    config = _lstm_config(tmp_path, epochs=1, batch_size=2)
+    bundle = _fake_bundle()
+
+    train(config, bundle, _examples(8), _examples(4), resume=False)
+
+    # These tests run on CPU only (no GPU in CI); this asserts the model actually landed on the
+    # device train() resolved, not merely that training didn't crash.
+    assert next(bundle.model.parameters()).device.type == "cpu"
+
+
+def test_train_logs_per_step_loss_lr_and_grad_norm(tmp_path, monkeypatch):
+    import llm_reward.train as train_module
+
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(train_module, "wandb", fake_wandb)
+    config = _lstm_config(tmp_path, epochs=1, batch_size=2)
+
+    train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
+
+    step_entries = [entry for entry in fake_wandb.logged if "train/global_step" in entry]
+    assert len(step_entries) == 4  # 8 train examples / batch_size 2
+    assert {"train/loss", "train/lr", "train/grad_norm", "train/global_step"} <= step_entries[0].keys()
+    assert [entry["train/global_step"] for entry in step_entries] == [0, 1, 2, 3]
+
+
+def test_train_logs_split_grad_norm_when_bundle_has_param_groups(tmp_path, monkeypatch):
+    import llm_reward.train as train_module
+
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(train_module, "wandb", fake_wandb)
+    config = _lstm_config(tmp_path, epochs=1, batch_size=2)
+
+    train(config, _fake_bundle(with_param_groups=True), _examples(8), _examples(4), resume=False)
+
+    step_entries = [entry for entry in fake_wandb.logged if "train/global_step" in entry]
+    assert "train/grad_norm_backbone" in step_entries[0]
+    assert "train/grad_norm_head" in step_entries[0]
+    assert "train/grad_norm" not in step_entries[0]
+
+
+def test_train_logs_epoch_summary_with_full_metric_set(tmp_path, monkeypatch):
     import llm_reward.train as train_module
 
     fake_wandb = _FakeWandb()
     monkeypatch.setattr(train_module, "wandb", fake_wandb)
     config = _lstm_config(tmp_path, epochs=2, batch_size=2)
-    bundle = _fake_bundle()
 
-    train(config, bundle, _examples(8), _examples(4), resume=False)
+    train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
 
-    logged_epochs = [entry["epoch"] for entry in fake_wandb.logged]
-    assert logged_epochs == [0, 1]
+    epoch_entries = _epoch_entries(fake_wandb.logged)
+    assert [entry["epoch"] for entry in epoch_entries] == [0, 1]
+    assert {
+        "train/epoch_loss", "train/epoch_accuracy", "val/loss", "val/accuracy", "val/macro_f1",
+        "val/precision_a", "val/recall_a", "val/f1_a", "val/confusion_matrix",
+    } <= epoch_entries[0].keys()
 
 
 def test_resume_continues_from_the_next_epoch(tmp_path, monkeypatch):
@@ -2487,12 +2696,28 @@ def test_resume_continues_from_the_next_epoch(tmp_path, monkeypatch):
     config = _lstm_config(tmp_path, epochs=2, batch_size=2)
 
     train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)
-    assert [entry["epoch"] for entry in fake_wandb.logged] == [0, 1]
+    assert [entry["epoch"] for entry in _epoch_entries(fake_wandb.logged)] == [0, 1]
 
     resumed_config = _lstm_config(tmp_path, epochs=4, batch_size=2)
     fake_wandb.logged.clear()
     train(resumed_config, _fake_bundle(), _examples(8), _examples(4), resume=True)
-    assert [entry["epoch"] for entry in fake_wandb.logged] == [2, 3]
+    assert [entry["epoch"] for entry in _epoch_entries(fake_wandb.logged)] == [2, 3]
+
+
+def test_resume_continues_the_global_step_counter(tmp_path, monkeypatch):
+    import llm_reward.train as train_module
+
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(train_module, "wandb", fake_wandb)
+    config = _lstm_config(tmp_path, epochs=1, batch_size=2)
+
+    train(config, _fake_bundle(), _examples(8), _examples(4), resume=False)  # 4 steps: 0..3
+
+    resumed_config = _lstm_config(tmp_path, epochs=2, batch_size=2)
+    fake_wandb.logged.clear()
+    train(resumed_config, _fake_bundle(), _examples(8), _examples(4), resume=True)
+    step_entries = [entry for entry in fake_wandb.logged if "train/global_step" in entry]
+    assert [entry["train/global_step"] for entry in step_entries] == [4, 5, 6, 7]
 
 
 def test_resume_with_a_wandb_run_id_reuses_it(tmp_path, monkeypatch):
@@ -2557,14 +2782,28 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from .data.dataset import PairwiseDataset
+from .evaluate import evaluate
 from .models.checkpoint import ConfigMismatchError
 from .negative_space import require
+
+
+def _group_grad_norm(params) -> float:
+    """The L2 norm of one param group's gradients, computed WITHOUT clipping them -- purely for
+    observability. Must be called before the single combined clip_grad_norm_ call below, or it
+    would report the post-clip norm instead."""
+    grads = [p.grad.detach() for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+    return torch.norm(torch.stack([g.norm() for g in grads])).item()
 
 
 def train(config: TrainConfig, bundle: ModelBundle, train_examples, val_examples, *, resume: bool) -> Checkpoint:
     require(config.epochs >= 1, f"epochs must be at least 1, got {config.epochs}")
     require(len(train_examples) > 0, "train() received zero training examples")
     require(len(val_examples) > 0, "train() received zero validation examples")
+
+    device = torch.accelerator.current_accelerator(check_available=True) or torch.device("cpu")
+    bundle.model.to(device)
 
     train_loader = DataLoader(
         PairwiseDataset(train_examples), batch_size=config.batch_size, shuffle=True,
@@ -2578,13 +2817,19 @@ def train(config: TrainConfig, bundle: ModelBundle, train_examples, val_examples
     optimizer = _make_optimizer(bundle, config)
     scheduler = _make_scheduler(optimizer, config, len(train_loader) * config.epochs)
     class_weights = (
-        torch.tensor(config.class_weights, dtype=torch.float32) if config.class_weights else None
+        torch.tensor(config.class_weights, dtype=torch.float32, device=device)
+        if config.class_weights else None
     )
 
     last_path = _last_path(config)
-    run_config = dataclasses.asdict(config) | {"variant": config.variant}
+    run_config = dataclasses.asdict(config) | {
+        "variant": config.variant,
+        "n_train_examples": len(train_examples),
+        "n_val_examples": len(val_examples),
+    }
+
     if resume and last_path.exists():
-        checkpoint: Checkpoint = torch.load(last_path, weights_only=False)
+        checkpoint: Checkpoint = torch.load(last_path, weights_only=False, map_location=device)
         if checkpoint.config != config:
             raise ConfigMismatchError(f"resume checkpoint at {last_path} was produced by a different config")
         bundle.model.load_state_dict(checkpoint.model_state)
@@ -2592,65 +2837,130 @@ def train(config: TrainConfig, bundle: ModelBundle, train_examples, val_examples
         if checkpoint.scheduler_state is not None:
             scheduler.load_state_dict(checkpoint.scheduler_state)
         start_epoch = checkpoint.epoch + 1
+        global_step = checkpoint.global_step
         best_val_metric = checkpoint.best_val_metric
-        wandb.init(project="llm-reward", id=checkpoint.wandb_run_id, resume="must", config=run_config)
+        init_kwargs = {"id": checkpoint.wandb_run_id, "resume": "must"}
     else:
         start_epoch = 0
+        global_step = 0
         best_val_metric = float("-inf")
-        wandb.init(project="llm-reward", resume="allow", config=run_config)
         checkpoint = None
+        init_kwargs = {"resume": "allow"}
 
-    for epoch in range(start_epoch, config.epochs):
-        bundle.model.train()
-        for batch in train_loader:
-            require("labels" in batch, "collate_fn output is missing the required 'labels' key")
-            labels = batch["labels"]
-            inputs = {k: v for k, v in batch.items() if k != "labels"}
-            logits = bundle.model(**inputs)
-            loss = torch.nn.functional.cross_entropy(logits, labels, weight=class_weights)
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(
-                [p for group in optimizer.param_groups for p in group["params"]],
-                config.max_grad_norm,
+    with wandb.init(project="llm-reward", config=run_config, **init_kwargs) as run:
+        run.define_metric("train/global_step")
+        run.define_metric("train/*", step_metric="train/global_step")
+        run.define_metric("epoch")
+        run.define_metric("val/*", step_metric="epoch")
+
+        for epoch in range(start_epoch, config.epochs):
+            bundle.model.train()
+            epoch_loss_sum = 0.0
+            epoch_correct = 0
+            epoch_n = 0
+
+            for batch in train_loader:
+                require("labels" in batch, "collate_fn output is missing the required 'labels' key")
+                batch = {k: v.to(device) for k, v in batch.items()}
+                labels = batch["labels"]
+                inputs = {k: v for k, v in batch.items() if k != "labels"}
+
+                with torch.autocast(
+                    device.type, dtype=torch.bfloat16, enabled=config.mixed_precision == "bf16"
+                ):
+                    logits = bundle.model(**inputs)
+                    loss = torch.nn.functional.cross_entropy(logits, labels, weight=class_weights)
+
+                optimizer.zero_grad()
+                loss.backward()
+
+                if bundle.param_groups is not None:
+                    grad_norm_backbone = _group_grad_norm(bundle.param_groups[0]["params"])
+                    grad_norm_head = _group_grad_norm(bundle.param_groups[1]["params"])
+                grad_norm = nn.utils.clip_grad_norm_(
+                    [p for group in optimizer.param_groups for p in group["params"]],
+                    config.max_grad_norm,
+                )
+                optimizer.step()
+                scheduler.step()
+
+                epoch_loss_sum += loss.item() * labels.shape[0]
+                epoch_correct += (logits.argmax(dim=-1) == labels).sum().item()
+                epoch_n += labels.shape[0]
+
+                step_log = {
+                    "train/loss": loss.item(),
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "train/global_step": global_step,
+                }
+                if bundle.param_groups is not None:
+                    step_log["train/grad_norm_backbone"] = grad_norm_backbone
+                    step_log["train/grad_norm_head"] = grad_norm_head
+                else:
+                    step_log["train/grad_norm"] = float(grad_norm)
+                run.log(step_log)
+                global_step += 1
+
+            metrics = evaluate(bundle.model, val_loader, device)
+            epoch_log = {
+                "epoch": epoch,
+                "train/epoch_loss": epoch_loss_sum / epoch_n,
+                "train/epoch_accuracy": epoch_correct / epoch_n,
+                "val/loss": metrics.loss,
+                "val/accuracy": metrics.accuracy,
+                "val/macro_f1": metrics.macro_f1,
+                "val/precision_a": metrics.per_class_precision[0],
+                "val/precision_b": metrics.per_class_precision[1],
+                "val/precision_tie": metrics.per_class_precision[2],
+                "val/recall_a": metrics.per_class_recall[0],
+                "val/recall_b": metrics.per_class_recall[1],
+                "val/recall_tie": metrics.per_class_recall[2],
+                "val/f1_a": metrics.per_class_f1[0],
+                "val/f1_b": metrics.per_class_f1[1],
+                "val/f1_tie": metrics.per_class_f1[2],
+                "val/confusion_matrix": wandb.Table(
+                    columns=["true_label", "pred_a", "pred_b", "pred_tie"],
+                    data=[
+                        [name, *row]
+                        for name, row in zip(("a", "b", "tie"), metrics.confusion_matrix)
+                    ],
+                ),
+            }
+            if device.type != "cpu":
+                epoch_log["system/gpu_mem_allocated_mb"] = (
+                    torch.accelerator.max_memory_allocated(device) / 1e6
+                )
+            run.log(epoch_log)
+
+            improved = metrics.accuracy > best_val_metric
+            best_val_metric = max(best_val_metric, metrics.accuracy)
+            checkpoint = Checkpoint(
+                epoch=epoch,
+                global_step=global_step,
+                model_state=bundle.model.state_dict(),
+                optimizer_state=optimizer.state_dict(),
+                scheduler_state=scheduler.state_dict(),
+                best_val_metric=best_val_metric,
+                config=config,
+                wandb_run_id=run.id,
             )
-            optimizer.step()
-            scheduler.step()
+            _save_checkpoint(last_path, checkpoint)
+            if improved:
+                _save_checkpoint(_best_path(config), checkpoint)
 
-        metrics = evaluate(bundle.model, val_loader)
-        wandb.log({"epoch": epoch, "val_loss": metrics.loss, "val_accuracy": metrics.accuracy})
-
-        improved = metrics.accuracy > best_val_metric
-        best_val_metric = max(best_val_metric, metrics.accuracy)
-        checkpoint = Checkpoint(
-            epoch=epoch,
-            model_state=bundle.model.state_dict(),
-            optimizer_state=optimizer.state_dict(),
-            scheduler_state=scheduler.state_dict(),
-            best_val_metric=best_val_metric,
-            config=config,
-            wandb_run_id=wandb.run.id,
-        )
-        _save_checkpoint(last_path, checkpoint)
-        if improved:
-            _save_checkpoint(_best_path(config), checkpoint)
-
-    wandb.finish()
     return checkpoint
 ```
-
-Also add the missing `from .evaluate import evaluate` import at the top of `src/llm_reward/train.py`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/test_train.py -v`
-Expected: PASS (14 tests)
+Expected: PASS (17 tests)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/llm_reward/train.py tests/test_train.py
-git commit -m "feat: add train() with epoch-boundary resume and W&B run continuity"
+git commit -m "feat: add train() with device placement, AMP, resume, and full W&B metrics"
 ```
 
 ---
@@ -2680,22 +2990,34 @@ from llm_reward.models.registry import ModelBundle
 from llm_reward.train import main
 
 
+class _FakeRun:
+    def __init__(self, logged: list[dict]) -> None:
+        self.id = "fake"
+        self._logged = logged
+
+    def log(self, data: dict) -> None:
+        self._logged.append(data)
+
+    def define_metric(self, *args, **kwargs) -> None:
+        pass
+
+    def __enter__(self) -> "_FakeRun":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        pass
+
+
 class _FakeWandb:
     def __init__(self) -> None:
-        self.logged = []
+        self.logged: list[dict] = []
 
     def init(self, **kwargs):
-        class _Run:
-            id = "fake"
-
-        self.run = _Run()
+        self.run = _FakeRun(self.logged)
         return self.run
 
-    def log(self, data):
-        self.logged.append(data)
-
-    def finish(self):
-        pass
+    def Table(self, *, columns, data):
+        return {"columns": columns, "data": data}
 
 
 def _write_config(tmp_path: Path) -> Path:
@@ -2871,8 +3193,8 @@ def test_push_to_hub_uploads_a_plain_module_via_upload_folder(tmp_path, monkeypa
 
     config = _PushTestConfig(seed=1, batch_size=2, epochs=1, lr=1e-2, output_dir=tmp_path, run_name="r")
     checkpoint = Checkpoint(
-        epoch=0, model_state=nn.Linear(4, 3).state_dict(), optimizer_state={}, scheduler_state=None,
-        best_val_metric=0.9, config=config, wandb_run_id="r",
+        epoch=0, global_step=4, model_state=nn.Linear(4, 3).state_dict(), optimizer_state={},
+        scheduler_state=None, best_val_metric=0.9, config=config, wandb_run_id="r",
     )
     checkpoint_path = tmp_path / "best.pt"
     torch.save(checkpoint, checkpoint_path)
@@ -2940,7 +3262,7 @@ def _model_card_text(checkpoint: Checkpoint) -> str:
 
 def push_to_hub(checkpoint_path: Path, repo_id: str, private: bool = True) -> str:
     require(checkpoint_path.exists(), f"checkpoint not found: {checkpoint_path}")
-    checkpoint: Checkpoint = torch.load(checkpoint_path, weights_only=False)
+    checkpoint: Checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
 
     bundle = build_model(checkpoint.config)
     bundle.model.load_state_dict(checkpoint.model_state)
@@ -2997,6 +3319,29 @@ open item (Task 7's note about verifying `_extract_text` against a real download
 flagged explicitly as a verification step with concrete instructions, not a TBD.
 
 **3. Type consistency:** `ModelBundle(model, collate_fn, param_groups)` is identical across
-Tasks 5, 9, 10, 11, 13, 15, 17. `Checkpoint`'s seven fields are identical across Tasks 6, 14, 15,
-17. `build_model`/`register`/`_REGISTRY` names are identical across Tasks 5, 9, 10, 11, 16.
+Tasks 5, 9, 10, 11, 13, 15, 17. `Checkpoint`'s eight fields (including `global_step`, added in this
+revision) are identical across Tasks 6, 14, 15, 17. `EvalMetrics`'s eight fields (confusion matrix
+plus per-class precision/recall/F1 plus macro-F1, also added in this revision) and `evaluate()`'s
+three-argument signature (`model, loader, device`) are identical across Tasks 12 and 15.
+`build_model`/`register`/`_REGISTRY` names are identical across Tasks 5, 9, 10, 11, 16.
 `load_config`/`ConfigError` names are identical across Tasks 4 and 16.
+
+**4. Post-pytorch-skill-review pass (this revision):** the plan was checked against the pytorch
+skill (verified live against the installed `torch==2.8.0`) and the observability-expert skill
+before any implementer was dispatched, per user request. Real findings and fixes, each propagated
+through every task that constructs the affected type:
+- Device placement was entirely absent from the original `train()`/`evaluate()` draft — a
+  correctness bug (training would silently never touch the GPU), not a style issue. Fixed in
+  Tasks 12 and 15; stated as a hard requirement in Global Constraints so it can't quietly regress.
+- Also caught in the same pass: Task 12's original test called `nn.Identity()` with a `features=`
+  kwarg, which raises `TypeError` (`Identity.forward`'s parameter is named `input`) — verified
+  with a real interpreter before writing the fix (`_IdentityOnFeatures`, Task 12).
+- Mixed precision (`mixed_precision` config field, Task 4), gradient checkpointing +
+  `enable_input_require_grads` for the two HF-backed variants (Tasks 10-11, verified against
+  peft's own parameter-naming behavior with a real tiny model, not assumed), and `map_location` on
+  every `torch.load` of a `Checkpoint` (Tasks 6, 15, 17) were missing and are now present.
+- W&B logging expanded from `{epoch, val_loss, val_accuracy}` to the full set described in Task 15
+  — per-step loss/LR/grad-norm (split by param group when `head_lr` is set), per-epoch train/val
+  loss and accuracy on the same `epoch` axis, and confusion-matrix-derived per-class
+  precision/recall/F1/macro-F1 — reviewed against observability-expert's W&B rules (hold the `run`
+  object, declare x-axes via `define_metric` rather than passing `step=`).
