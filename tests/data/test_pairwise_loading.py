@@ -27,6 +27,23 @@ def test_load_pairwise_examples_joins_list_encoded_turns():
     assert "again" in multi_turn.prompt
 
 
+def test_load_pairwise_examples_parses_a_field_larger_than_csvs_default_limit(tmp_path):
+    """csv's stdlib default field_size_limit is 131072 bytes -- too small for a real multi-turn
+    LLM conversation joined into one field. This must not raise _csv.Error: field larger than
+    field limit."""
+    big_csv = tmp_path / "big_field.csv"
+    huge_prompt = "x" * 200_000  # bigger than csv's 131072-byte default limit
+    with big_csv.open("w", newline="", encoding="utf-8") as f:
+        f.write(
+            "id,model_a,model_b,prompt,response_a,response_b,"
+            "winner_model_a,winner_model_b,winner_tie\n"
+        )
+        f.write(f'1,m,n,"{huge_prompt}",a,b,1,0,0\n')
+
+    examples = load_pairwise_examples(big_csv)
+    assert len(examples[0].prompt) == 200_000
+
+
 def test_load_pairwise_examples_raises_on_missing_file(tmp_path):
     with pytest.raises(CheckFailed, match="not found"):
         load_pairwise_examples(tmp_path / "does_not_exist.csv")
@@ -104,6 +121,14 @@ def test_extract_text_falls_back_to_ast_literal_eval_for_single_quoted_list():
 
 def test_extract_text_returns_raw_string_for_plain_non_list_text():
     assert _extract_text("What is 2+2?") == "What is 2+2?"
+
+
+def test_extract_text_returns_raw_string_when_it_looks_like_a_set_of_dicts():
+    # Real bug: text starting with "{" that isn't valid JSON parses under ast.literal_eval as a
+    # set literal containing dict elements -- constructing that set raises TypeError (dicts are
+    # unhashable), not ValueError/SyntaxError, which _extract_text's fallback used to miss.
+    value = '{{"role": "user"}, {"role": "assistant"}}'
+    assert _extract_text(value) == value
 
 
 def test_split_train_val_rejects_out_of_range_fraction():

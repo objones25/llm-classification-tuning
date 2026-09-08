@@ -98,8 +98,10 @@ configs/
   small_sft_head.yaml
   medium_lora.yaml
 scripts/
-  download_data.py  # thin CLI: download_competition_data() -> copy train/test/sample_submission
-                    # CSVs into data/raw/, the local path train.py/submit.py default to
+  download_data.py  # download_competition_data() -> copy train/test/sample_submission CSVs into
+                    # data/raw/ (the local path train.py/submit.py default to), then by default
+                    # append lmarena-ai/arena-human-preference-100k onto train.csv
+                    # (--no-include-external to skip); see the External Data note below
   push_to_hub.py    # opt-in: push a reviewed checkpoint's weights (+ tokenizer, + model card) to
                     # the HF Hub — the durable store, since /workspace doesn't survive pod deletion
   runpod_train.sh   # RunPod-only entrypoint: fails fast unless checked out under /workspace,
@@ -134,6 +136,33 @@ first RunPod run, before this check existed, over the `winner_tie`/`winner_model
 noted above). `scripts/download_data.py` runs the same check on all three files after download,
 before copying them into `data/raw/` — so a schema change on Kaggle's end is caught at download
 time, not partway through a training run.
+
+**External Data: `arena-human-preference-100k` is appended onto `train.csv` by default.**
+Permitted under the competition's External Data rule (Section 5): its prompts are CC-BY-4.0 and
+its model outputs are governed by each model provider's own terms -- the same licensing
+arrangement the competition's own training data is already under, not a new risk category.
+`scripts/download_data.py`'s `_convert_external_row` maps its schema onto ours: `question_id`→
+`id`, `model_a`/`model_b` pass through unchanged, `conversation_a`/`conversation_b` (lists of
+`{role, content}` turn dicts) get reduced to `prompt`/`response_a`/`response_b`, and `winner`
+(verified with a real sample to take 4 distinct values: `model_a`, `model_b`, `tie`, and
+`tie (bothbad)` — the last two are genuinely separate strings, not pre-merged) gets one-hot
+encoded, `tie` and `tie (bothbad)` both mapping to `winner_tie`. The extracted turns are
+JSON-encoded (`json.dumps(turns)`), matching train.csv's own on-disk encoding, so
+`data/pairwise.py`'s `_extract_text` parses this data through the exact same `json.loads` path as
+real Kaggle rows — emitting pre-joined plain text instead would make ordinary prose fall through
+to `_extract_text`'s `ast.literal_eval` fallback and reintroduce `SyntaxWarning` spam on content
+never meant to go through it. After appending, ids are checked for uniqueness across the combined
+file (`require(len(ids) == len(set(ids)), ...)`). `download_to_data_raw` always re-copies a fresh
+`train.csv` from the Kaggle cache before appending, so re-running `download_data.py` is still
+idempotent — it never accumulates duplicate external rows.
+
+**`csv.field_size_limit` is raised, not left at the stdlib default.** `data/pairwise.py` sets it
+to 10,000,000 at import time (module-level, so every `csv.reader`/`DictReader` in the process
+benefits, not only its own). The default (131,072 bytes) is too small for a real multi-turn LLM
+conversation joined into one field — this crashed on the first real end-to-end run once
+external data was added, and is exactly the kind of large-field problem the original Kaggle data
+could eventually hit too. Raised, not removed (`sys.maxsize`), so a genuinely corrupt file still
+fails loudly rather than reading unboundedly.
 
 **Best-checkpoint criterion is val_loss, and early stopping is opt-in per config.** `best.pt` is
 saved whenever `val_loss` improves (not `val_accuracy` — a real run's accuracy stayed flat/noisy

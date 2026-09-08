@@ -9,6 +9,11 @@ from pathlib import Path
 
 from ..negative_space import bounded, require
 
+# csv's default (131072 bytes) is too small for a real multi-turn LLM conversation joined into
+# one field -- raised, not removed (bounded per CLAUDE.md's negative-space rules), so a
+# genuinely corrupt/pathological file still fails loudly instead of reading unboundedly.
+csv.field_size_limit(10_000_000)
+
 # The real train.csv/test.csv have this asymmetric naming: only the tie column lacks the
 # _model_ infix the other two winner columns carry (verified against the downloaded competition
 # archive -- an earlier assumption of `winner_model_tie` crashed on the real data).
@@ -59,7 +64,11 @@ def _extract_text(value: str) -> str:
     except ValueError:
         try:
             parsed = ast.literal_eval(value)
-        except (ValueError, SyntaxError):
+        # TypeError too: text starting with "{" but not valid dict syntax (e.g. plain prose
+        # a model wrote that happens to look like `{"a"}, {"b"}`) parses as a set literal
+        # containing dicts, and building that set raises TypeError ("unhashable type: 'dict'")
+        # rather than ValueError/SyntaxError.
+        except (ValueError, SyntaxError, TypeError):
             return value
     if isinstance(parsed, list):
         return "\n".join(str(turn) for turn in parsed)
