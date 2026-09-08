@@ -2,7 +2,12 @@
 import pytest
 
 from llm_reward.negative_space import CheckFailed
-from scripts.plot_run_metrics import _step_series, align_epoch_to_global_step, plot_run_metrics
+from scripts.plot_run_metrics import (
+    _save_figure,
+    _step_series,
+    align_epoch_to_global_step,
+    plot_run_metrics,
+)
 
 NAN = float("nan")
 
@@ -59,7 +64,7 @@ def test_align_epoch_to_global_step_raises_if_epoch_logged_before_any_step():
 
 
 def test_plot_run_metrics_writes_expected_files_for_lstm_style_run(tmp_path):
-    paths = plot_run_metrics(_lstm_style_history(), tmp_path)
+    paths = plot_run_metrics(_lstm_style_history(), tmp_path, "lstm_baseline")
 
     names = {p.name for p in paths}
     assert names == {
@@ -93,7 +98,7 @@ def _sft_head_style_history() -> list[dict]:
 
 
 def test_plot_run_metrics_uses_split_grad_norm_when_present(tmp_path):
-    paths = plot_run_metrics(_sft_head_style_history(), tmp_path)
+    paths = plot_run_metrics(_sft_head_style_history(), tmp_path, "small_sft_head")
     assert "grad_norm.png" in {p.name for p in paths}
 
     # The plot's filename is the same either way ("grad_norm.png") -- what actually differs is
@@ -108,10 +113,34 @@ def test_plot_run_metrics_uses_split_grad_norm_when_present(tmp_path):
 
 def test_plot_run_metrics_raises_on_empty_history(tmp_path):
     with pytest.raises(CheckFailed, match="empty history"):
-        plot_run_metrics([], tmp_path)
+        plot_run_metrics([], tmp_path, "lstm_baseline")
 
 
 def test_plot_run_metrics_creates_output_directory(tmp_path):
     dest = tmp_path / "nested" / "run-id"
-    plot_run_metrics(_lstm_style_history(), dest)
+    plot_run_metrics(_lstm_style_history(), dest, "lstm_baseline")
     assert dest.exists()
+
+
+def test_save_figure_embeds_run_name_in_the_title(tmp_path):
+    fig_path = _save_figure(tmp_path, "loss", {"train/loss": ([0, 1], [1.0, 0.5])}, "lstm_baseline")
+    assert fig_path.exists()
+
+
+def test_plot_run_titles_include_the_run_name(tmp_path, monkeypatch):
+    """_save_figure closes its figure before returning, so assert on the title through a spy
+    instead of trying to inspect a closed Figure."""
+    import scripts.plot_run_metrics as plot_module
+
+    seen_titles: list[str] = []
+    real_save_figure = plot_module._save_figure
+
+    def _spy(output_dir, name, series, run_name):
+        seen_titles.append(f"{run_name} — {name}")
+        return real_save_figure(output_dir, name, series, run_name)
+
+    monkeypatch.setattr(plot_module, "_save_figure", _spy)
+    plot_module.plot_run_metrics(_lstm_style_history(), tmp_path, "lstm_baseline")
+
+    assert "lstm_baseline — loss" in seen_titles
+    assert "lstm_baseline — accuracy" in seen_titles

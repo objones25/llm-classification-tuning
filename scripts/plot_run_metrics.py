@@ -1,4 +1,4 @@
-"""Fetch a W&B run's metric history and save comparison plots to graphs/plots/<run_id>/.
+"""Fetch a W&B run's metric history and save comparison plots to graphs/plots/<name>/.
 
 train/* metrics are logged per training step (x-axis: train/global_step); val/* and the
 per-epoch train/epoch_* metrics are logged once per epoch (x-axis: epoch), per
@@ -6,7 +6,8 @@ train.py's run.define_metric("val/*", step_metric="epoch") setup. To compare the
 axis, every epoch-indexed metric here gets remapped onto the train/global_step value active
 at that point in the run -- the last train/global_step logged before/at that epoch's entry.
 
-Usage: uv run python scripts/plot_run_metrics.py <run_id> [--entity OWNER] [--project NAME]
+Usage: uv run python scripts/plot_run_metrics.py <run_id> [--name lstm_baseline]
+                                                            [--entity OWNER] [--project NAME]
 """
 
 from __future__ import annotations
@@ -98,7 +99,7 @@ def _discover_metric_keys(history: list[dict]) -> tuple[set[str], set[str]]:
 
 
 def _save_figure(
-    output_dir: Path, name: str, series: dict[str, tuple[list[int], list[float]]]
+    output_dir: Path, name: str, series: dict[str, tuple[list[int], list[float]]], run_name: str
 ) -> Path:
     fig, ax = plt.subplots(figsize=(8, 5))
     for label, (xs, ys) in series.items():
@@ -106,7 +107,7 @@ def _save_figure(
             ax.plot(xs, ys, label=label, marker="o", markersize=3)
     ax.set_xlabel("global_step")
     ax.set_ylabel(name)
-    ax.set_title(name)
+    ax.set_title(f"{run_name} — {name}")
     ax.legend()
     ax.grid(True, alpha=0.3)
     path = output_dir / f"{name}.png"
@@ -115,8 +116,12 @@ def _save_figure(
     return path
 
 
-def plot_run_metrics(history: list[dict], output_dir: Path) -> list[Path]:
-    """Pure function: history -> saved PNG paths. No network -- unit-testable with canned data."""
+def plot_run_metrics(history: list[dict], output_dir: Path, run_name: str) -> list[Path]:
+    """Pure function: history -> saved PNG paths. No network -- unit-testable with canned data.
+
+    run_name is a human-readable label (e.g. "lstm_baseline") embedded in every plot's title --
+    distinct from the wandb run id, since a folder/title full of run ids doesn't say which
+    variant produced it."""
     require(len(history) > 0, "empty history -- nothing to plot")
     output_dir.mkdir(parents=True, exist_ok=True)
     epoch_to_step = align_epoch_to_global_step(history)
@@ -133,7 +138,7 @@ def plot_run_metrics(history: list[dict], output_dir: Path) -> list[Path]:
     if "val/loss" in epoch_keys:
         loss_series["val/loss"] = _epoch_series(history, "val/loss", epoch_to_step)
     if loss_series:
-        paths.append(_save_figure(output_dir, "loss", loss_series))
+        paths.append(_save_figure(output_dir, "loss", loss_series, run_name))
 
     accuracy_series = {}
     if "train/epoch_accuracy" in epoch_keys:
@@ -143,12 +148,12 @@ def plot_run_metrics(history: list[dict], output_dir: Path) -> list[Path]:
     if "val/accuracy" in epoch_keys:
         accuracy_series["val/accuracy"] = _epoch_series(history, "val/accuracy", epoch_to_step)
     if accuracy_series:
-        paths.append(_save_figure(output_dir, "accuracy", accuracy_series))
+        paths.append(_save_figure(output_dir, "accuracy", accuracy_series, run_name))
 
     # Standalone per-step plots.
     if "train/lr" in step_keys:
         lr_series = {"train/lr": _step_series(history, "train/lr")}
-        paths.append(_save_figure(output_dir, "lr", lr_series))
+        paths.append(_save_figure(output_dir, "lr", lr_series, run_name))
 
     grad_norm_series = {}
     if "train/grad_norm" in step_keys:
@@ -160,7 +165,7 @@ def plot_run_metrics(history: list[dict], output_dir: Path) -> list[Path]:
     if "train/grad_norm_head" in step_keys:
         grad_norm_series["train/grad_norm_head"] = _step_series(history, "train/grad_norm_head")
     if grad_norm_series:
-        paths.append(_save_figure(output_dir, "grad_norm", grad_norm_series))
+        paths.append(_save_figure(output_dir, "grad_norm", grad_norm_series, run_name))
 
     # Standalone per-epoch val plots.
     if "val/macro_f1" in epoch_keys:
@@ -168,6 +173,7 @@ def plot_run_metrics(history: list[dict], output_dir: Path) -> list[Path]:
             _save_figure(
                 output_dir, "val_macro_f1",
                 {"val/macro_f1": _epoch_series(history, "val/macro_f1", epoch_to_step)},
+                run_name,
             )
         )
 
@@ -178,7 +184,7 @@ def plot_run_metrics(history: list[dict], output_dir: Path) -> list[Path]:
             if key in epoch_keys:
                 group_series[key] = _epoch_series(history, key, epoch_to_step)
         if group_series:
-            paths.append(_save_figure(output_dir, f"val_{metric_group}", group_series))
+            paths.append(_save_figure(output_dir, f"val_{metric_group}", group_series, run_name))
 
     if "system/gpu_mem_allocated_mb" in epoch_keys:
         paths.append(
@@ -189,6 +195,7 @@ def plot_run_metrics(history: list[dict], output_dir: Path) -> list[Path]:
                         history, "system/gpu_mem_allocated_mb", epoch_to_step
                     )
                 },
+                run_name,
             )
         )
 
@@ -202,9 +209,14 @@ def fetch_run_history(run_id: str, *, entity: str, project: str) -> list[dict]:
     return run.history(pandas=False, samples=1_000_000)
 
 
-def plot_run(run_id: str, *, entity: str, project: str, output_dir: Path) -> list[Path]:
+def plot_run(
+    run_id: str, *, entity: str, project: str, output_dir: Path, name: str | None = None
+) -> list[Path]:
+    """name (e.g. "lstm_baseline") names both the output folder and the plot titles -- defaults
+    to run_id (opaque, e.g. "0idyd8x7") when not given."""
     history = fetch_run_history(run_id, entity=entity, project=project)
-    return plot_run_metrics(history, output_dir / run_id)
+    run_name = name or run_id
+    return plot_run_metrics(history, output_dir / run_name, run_name)
 
 
 def main() -> None:
@@ -213,13 +225,19 @@ def main() -> None:
     load_dotenv()
     parser = argparse.ArgumentParser(description="Plot a W&B run's train/val metrics")
     parser.add_argument("run_id")
+    parser.add_argument(
+        "--name",
+        help="Human-readable label for the output folder and plot titles "
+        "(e.g. lstm_baseline) -- defaults to run_id",
+    )
     parser.add_argument("--entity", default="objones25")
     parser.add_argument("--project", default="llm-reward")
     parser.add_argument("--output-dir", type=Path, default=Path("graphs/plots"))
     args = parser.parse_args()
 
     paths = plot_run(
-        args.run_id, entity=args.entity, project=args.project, output_dir=args.output_dir
+        args.run_id, entity=args.entity, project=args.project, output_dir=args.output_dir,
+        name=args.name,
     )
     for path in paths:
         print(path)
