@@ -40,17 +40,25 @@ def make_collate_fn(vocab_size: int, max_seq_len: int):
 
 class LSTMClassifier(nn.Module):
     def __init__(
-        self, vocab_size: int, embedding_dim: int, hidden_dim: int, num_layers: int
+        self, vocab_size: int, embedding_dim: int, hidden_dim: int, num_layers: int,
+        dropout: float,
     ) -> None:
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
-        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers=num_layers, batch_first=True)
+        self.embedding_dropout = nn.Dropout(dropout)
+        # nn.LSTM's own dropout param only applies BETWEEN stacked layers, so it's a no-op at
+        # num_layers=1 -- passing it unconditionally would raise nn.LSTM's own UserWarning.
+        self.lstm = nn.LSTM(
+            embedding_dim, hidden_dim, num_layers=num_layers, batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+        self.output_dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden_dim, 3)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        embedded = self.embedding(token_ids)
+        embedded = self.embedding_dropout(self.embedding(token_ids))
         _, (hidden, _) = self.lstm(embedded)
-        return self.classifier(hidden[-1])
+        return self.classifier(self.output_dropout(hidden[-1]))
 
 
 @register(LSTMConfig.variant)
@@ -65,6 +73,7 @@ def build_model(config: TrainConfig) -> ModelBundle:
         embedding_dim=config.embedding_dim,
         hidden_dim=config.hidden_dim,
         num_layers=config.num_layers,
+        dropout=config.dropout,
     )
     collate_fn = make_collate_fn(config.vocab_size, config.max_seq_len)
     return ModelBundle(model=model, collate_fn=collate_fn)

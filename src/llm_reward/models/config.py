@@ -38,6 +38,7 @@ class LSTMConfig(TrainConfig):
     embedding_dim: int = 256
     hidden_dim: int = 512
     num_layers: int = 2
+    dropout: float = 0.3
 
 
 @dataclass(frozen=True, kw_only=True)

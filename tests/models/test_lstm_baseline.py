@@ -57,17 +57,41 @@ def test_one_training_step_lowers_loss(tiny_pairwise_examples):
     batch = bundle.collate_fn(tiny_pairwise_examples[:4])
     optimizer = torch.optim.AdamW(bundle.model.parameters(), lr=config.lr)
 
+    # eval() for both loss measurements -- dropout is stochastic, so comparing a train()-mode
+    # loss before against another train()-mode loss after would compare two different random
+    # masks, not the effect of the optimizer step.
+    bundle.model.eval()
     loss_before = torch.nn.functional.cross_entropy(
         bundle.model(batch["token_ids"]), batch["labels"]
     )
+    bundle.model.train()
     optimizer.zero_grad()
     loss_before.backward()
     optimizer.step()
+    bundle.model.eval()
     with torch.no_grad():
         loss_after = torch.nn.functional.cross_entropy(
             bundle.model(batch["token_ids"]), batch["labels"]
         )
     assert loss_after.item() < loss_before.item()
+
+
+def test_dropout_is_active_in_train_mode_and_off_in_eval_mode(tiny_pairwise_examples):
+    config = _config(dropout=0.5)
+    bundle = lstm_baseline.build_model(config)
+    batch = bundle.collate_fn(tiny_pairwise_examples[:4])
+
+    bundle.model.train()
+    with torch.no_grad():
+        train_a = bundle.model(batch["token_ids"])
+        train_b = bundle.model(batch["token_ids"])
+    assert not torch.equal(train_a, train_b)  # different random dropout masks each call
+
+    bundle.model.eval()
+    with torch.no_grad():
+        eval_a = bundle.model(batch["token_ids"])
+        eval_b = bundle.model(batch["token_ids"])
+    torch.testing.assert_close(eval_a, eval_b)  # dropout off -- deterministic
 
 
 def test_all_parameters_receive_gradients(tiny_pairwise_examples):
