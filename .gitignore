@@ -32,5 +32,8 @@ outputs/
 wandb/
 submission*.csv
 
+# Regenerated from W&B by scripts/plot_run_metrics.py
+graphs/
+
 # macOS
 .DS_Store

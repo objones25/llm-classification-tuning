@@ -107,6 +107,10 @@ scripts/
   runpod_train.sh   # RunPod-only entrypoint: fails fast unless checked out under /workspace,
                     # points HF_HOME/KAGGLEHUB_CACHE there, uv sync, download_data.py if needed,
                     # then `uv run python -m llm_reward.train --config <config.yaml> [args...]`
+  plot_run_metrics.py  # fetch a W&B run's history, save loss/accuracy/lr/grad_norm/val-metric
+                    # plots (train vs val on one global_step-aligned axis) to graphs/plots/<run_id>/
+                    # -- `uv run python scripts/plot_run_metrics.py <run_id>`; graphs/ is
+                    # gitignored, regeneratable from W&B at any time
 ```
 
 **Model registry is the DRY seam.** `train.py`, `evaluate.py`, and `submit.py` are all
@@ -187,6 +191,14 @@ reuses the transformer backbone's learned representations, replacing the LM head
 classification head — reward models in the RLHF literature (InstructGPT, Anthropic's HH-RLHF,
 Llama 2) are routinely initialized from SFT checkpoints for exactly this reason, since a model
 that already represents "what a good answer looks like" transfers well to judging one.
+
+**`plot_run_metrics.py` puts train and val on one shared x-axis.** `train/*` metrics are logged
+per step (x-axis: `train/global_step`); `val/*` and the per-epoch `train/epoch_*` metrics are
+logged once per epoch (x-axis: `epoch`, per `train.py`'s
+`run.define_metric("val/*", step_metric="epoch")`). `align_epoch_to_global_step` remaps every
+epoch-indexed metric onto whatever `train/global_step` was last logged at or before that epoch's
+entry, so `loss.png`/`accuracy.png` can plot `train/loss` (noisy, per-step) against
+`val/loss`/`val/accuracy` (per-epoch) on the same axis instead of two incomparable ones.
 
 **Best-checkpoint criterion is val_loss, and early stopping is opt-in per config.** `best.pt` is
 saved whenever `val_loss` improves (not `val_accuracy` — a real run's accuracy stayed flat/noisy

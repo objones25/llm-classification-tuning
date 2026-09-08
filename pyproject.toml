@@ -17,6 +17,7 @@ dependencies = [
     "wandb>=0.19",
     "pyyaml>=6.0.3",
     "datasets>=5.0.1",
+    "matplotlib>=3.11.1",
 ]
 
 [dependency-groups]
