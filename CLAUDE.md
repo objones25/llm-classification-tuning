@@ -108,8 +108,9 @@ scripts/
                     # points HF_HOME/KAGGLEHUB_CACHE there, uv sync, download_data.py if needed,
                     # then `uv run python -m llm_reward.train --config <config.yaml> [args...]`
   plot_run_metrics.py  # fetch a W&B run's history, save loss/accuracy/lr/grad_norm/val-metric
-                    # plots (train vs val on one global_step-aligned axis) to graphs/plots/<run_id>/
-                    # -- `uv run python scripts/plot_run_metrics.py <run_id>`; graphs/ is
+                    # plots (train vs val on one global_step-aligned axis) plus a per-epoch
+                    # confusion-matrix grid to graphs/plots/<name>/ -- `uv run python
+                    # scripts/plot_run_metrics.py <run_id> --name lstm_baseline`; graphs/ is
                     # gitignored, regeneratable from W&B at any time
 ```
 
@@ -199,6 +200,13 @@ logged once per epoch (x-axis: `epoch`, per `train.py`'s
 epoch-indexed metric onto whatever `train/global_step` was last logged at or before that epoch's
 entry, so `loss.png`/`accuracy.png` can plot `train/loss` (noisy, per-step) against
 `val/loss`/`val/accuracy` (per-epoch) on the same axis instead of two incomparable ones.
+
+**`val/confusion_matrix` needs a separate download, not a history read.** It's logged as a
+`wandb.Table`, so its `run.history()` entry is only a reference dict (`{"_type": "table-file",
+"path": "media/table/...", ...}` — confirmed against a real run, not assumed) pointing at a
+media file, not the table's actual data. `fetch_confusion_matrices` downloads and parses each
+epoch's table with `run.file(path).download(...)`; `save_confusion_matrices` renders all epochs
+as one figure (one heatmap subplot per epoch) to `confusion_matrix.png`.
 
 **Best-checkpoint criterion is val_loss, and early stopping is opt-in per config.** `best.pt` is
 saved whenever `val_loss` improves (not `val_accuracy` — a real run's accuracy stayed flat/noisy

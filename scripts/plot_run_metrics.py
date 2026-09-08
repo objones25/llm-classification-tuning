@@ -13,7 +13,9 @@ Usage: uv run python scripts/plot_run_metrics.py <run_id> [--name lstm_baseline]
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import tempfile
 from pathlib import Path
 
 import matplotlib
@@ -24,9 +26,12 @@ import wandb
 
 from llm_reward.negative_space import require
 
-# Never a plottable scalar series.
+# Never a plottable scalar series -- val/confusion_matrix is handled separately (it's a
+# wandb.Table reference, not a scalar; see fetch_confusion_matrices).
 _NON_METRIC_KEYS = {"_step", "_runtime", "_timestamp", "epoch", "train/global_step"}
 _NON_METRIC_SUFFIXES = ("confusion_matrix",)
+_CONFUSION_MATRIX_KEY = "val/confusion_matrix"
+_CONFUSION_MATRIX_CLASSES = ("a", "b", "tie")
 
 
 def _is_missing(value: object) -> bool:
@@ -203,6 +208,68 @@ def plot_run_metrics(history: list[dict], output_dir: Path, run_name: str) -> li
     return paths
 
 
+def fetch_confusion_matrices(run, history: list[dict]) -> list[tuple[int, list[str], list[list]]]:
+    """val/confusion_matrix is a wandb.Table, not a scalar -- its history entry is only a
+    reference (a path into the run's media files, confirmed by inspecting a real run rather
+    than assumed), not the table's actual data. This downloads and parses each epoch's table,
+    returning [(epoch, columns, data), ...] sorted by epoch. `run` must support .file(path)
+    like a real wandb Api run (a fake stands in for this in tests -- no network there)."""
+    results: list[tuple[int, list[str], list[list]]] = []
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for row in history:
+            ref = row.get(_CONFUSION_MATRIX_KEY)
+            epoch = row.get("epoch")
+            if _is_missing(ref) or _is_missing(epoch) or not isinstance(ref, dict):
+                continue
+            downloaded = run.file(ref["path"]).download(root=tmpdir, replace=True)
+            with open(downloaded.name, encoding="utf-8") as f:
+                table = json.load(f)
+            results.append((int(epoch), table["columns"], table["data"]))
+    results.sort(key=lambda entry: entry[0])
+    return results
+
+
+def save_confusion_matrices(
+    output_dir: Path,
+    run_name: str,
+    confusion_matrices: list[tuple[int, list[str], list[list]]],
+) -> Path | None:
+    """One figure, one heatmap subplot per epoch -- lets the whole run's confusion matrix
+    evolution be seen at a glance, the same "one file per metric family" shape as _save_figure's
+    line plots. Returns None (nothing to plot) if confusion_matrices is empty, rather than
+    raising -- a run without this metric (or a stale/older run) shouldn't block the rest."""
+    if not confusion_matrices:
+        return None
+
+    n = len(confusion_matrices)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 4), squeeze=False)
+    for ax, (epoch, _columns, data) in zip(axes[0], confusion_matrices, strict=True):
+        # columns[0] is "true_label"; columns[1:] are "pred_a"/"pred_b"/"pred_tie" -- drop the
+        # label column to get the bare N x N count matrix.
+        matrix = [row[1:] for row in data]
+        flat = [v for row in matrix for v in row]
+        vmax = max(flat) if flat else 1
+        ax.imshow(matrix, cmap="Blues", vmin=0, vmax=vmax)
+        ax.set_xticks(range(len(_CONFUSION_MATRIX_CLASSES)))
+        ax.set_xticklabels(_CONFUSION_MATRIX_CLASSES)
+        ax.set_yticks(range(len(_CONFUSION_MATRIX_CLASSES)))
+        ax.set_yticklabels(_CONFUSION_MATRIX_CLASSES)
+        ax.set_xlabel("predicted")
+        ax.set_ylabel("true")
+        ax.set_title(f"epoch {epoch}")
+        for i, row_values in enumerate(matrix):
+            for j, value in enumerate(row_values):
+                color = "white" if vmax and value > vmax / 2 else "black"
+                ax.text(j, i, str(value), ha="center", va="center", color=color)
+
+    fig.suptitle(f"{run_name} — confusion matrix")
+    fig.tight_layout()
+    path = output_dir / "confusion_matrix.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
 def fetch_run_history(run_id: str, *, entity: str, project: str) -> list[dict]:
     api = wandb.Api()
     run = api.run(f"{entity}/{project}/{run_id}")
@@ -214,9 +281,20 @@ def plot_run(
 ) -> list[Path]:
     """name (e.g. "lstm_baseline") names both the output folder and the plot titles -- defaults
     to run_id (opaque, e.g. "0idyd8x7") when not given."""
-    history = fetch_run_history(run_id, entity=entity, project=project)
+    api = wandb.Api()
+    run = api.run(f"{entity}/{project}/{run_id}")
+    history = run.history(pandas=False, samples=1_000_000)
     run_name = name or run_id
-    return plot_run_metrics(history, output_dir / run_name, run_name)
+    dest = output_dir / run_name
+
+    paths = plot_run_metrics(history, dest, run_name)
+
+    confusion_matrices = fetch_confusion_matrices(run, history)
+    confusion_matrix_path = save_confusion_matrices(dest, run_name, confusion_matrices)
+    if confusion_matrix_path is not None:
+        paths.append(confusion_matrix_path)
+
+    return paths
 
 
 def main() -> None:

@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 
 import pytest
 
@@ -6,7 +8,9 @@ from scripts.plot_run_metrics import (
     _save_figure,
     _step_series,
     align_epoch_to_global_step,
+    fetch_confusion_matrices,
     plot_run_metrics,
+    save_confusion_matrices,
 )
 
 NAN = float("nan")
@@ -144,3 +148,109 @@ def test_plot_run_titles_include_the_run_name(tmp_path, monkeypatch):
 
     assert "lstm_baseline — loss" in seen_titles
     assert "lstm_baseline — accuracy" in seen_titles
+
+
+class _FakeDownloadedFile:
+    """Stands in for what wandb's File.download() returns -- an object whose .name is the full
+    local path (matched against a real download in conversation, not assumed)."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _FakeWandbFile:
+    def __init__(self, table_json: dict) -> None:
+        self._table_json = table_json
+
+    def download(self, root, replace=True):
+        dest = Path(root) / "table.json"
+        dest.write_text(json.dumps(self._table_json))
+        return _FakeDownloadedFile(str(dest))
+
+
+class _FakeRun:
+    """Stands in for a real wandb Api run -- only .file(path) is used by
+    fetch_confusion_matrices, matching the real object's contract as verified against an actual
+    run (val/confusion_matrix's history entry is a {"path": ..., "_type": "table-file", ...}
+    reference, not the table's data)."""
+
+    def __init__(self, tables_by_path: dict[str, dict]) -> None:
+        self._tables_by_path = tables_by_path
+
+    def file(self, path: str) -> _FakeWandbFile:
+        return _FakeWandbFile(self._tables_by_path[path])
+
+
+def _confusion_table(true_a_row, true_b_row, true_tie_row) -> dict:
+    return {
+        "columns": ["true_label", "pred_a", "pred_b", "pred_tie"],
+        "data": [["a", *true_a_row], ["b", *true_b_row], ["tie", *true_tie_row]],
+    }
+
+
+def test_fetch_confusion_matrices_downloads_and_parses_each_epoch(tmp_path):
+    history = [
+        {
+            "epoch": 0,
+            "val/confusion_matrix": {"_type": "table-file", "path": "media/table/epoch0.json"},
+        },
+        {
+            "epoch": 1,
+            "val/confusion_matrix": {"_type": "table-file", "path": "media/table/epoch1.json"},
+        },
+    ]
+    run = _FakeRun({
+        "media/table/epoch0.json": _confusion_table([5, 0, 1], [0, 4, 2], [1, 1, 3]),
+        "media/table/epoch1.json": _confusion_table([6, 0, 0], [0, 5, 1], [0, 1, 4]),
+    })
+
+    result = fetch_confusion_matrices(run, history)
+
+    assert [entry[0] for entry in result] == [0, 1]
+    assert result[0][1] == ["true_label", "pred_a", "pred_b", "pred_tie"]
+    assert result[0][2] == [["a", 5, 0, 1], ["b", 0, 4, 2], ["tie", 1, 1, 3]]
+
+
+def test_fetch_confusion_matrices_returns_empty_list_when_metric_absent():
+    history = [{"epoch": 0, "val/loss": 1.0}]
+    result = fetch_confusion_matrices(_FakeRun({}), history)
+    assert result == []
+
+
+def test_fetch_confusion_matrices_sorts_by_epoch_even_if_out_of_order():
+    history = [
+        {
+            "epoch": 2,
+            "val/confusion_matrix": {"_type": "table-file", "path": "media/table/epoch2.json"},
+        },
+        {
+            "epoch": 0,
+            "val/confusion_matrix": {"_type": "table-file", "path": "media/table/epoch0.json"},
+        },
+    ]
+    run = _FakeRun({
+        "media/table/epoch2.json": _confusion_table([1, 0, 0], [0, 1, 0], [0, 0, 1]),
+        "media/table/epoch0.json": _confusion_table([1, 0, 0], [0, 1, 0], [0, 0, 1]),
+    })
+
+    result = fetch_confusion_matrices(run, history)
+    assert [entry[0] for entry in result] == [0, 2]
+
+
+def test_save_confusion_matrices_returns_none_for_empty_list(tmp_path):
+    assert save_confusion_matrices(tmp_path, "lstm_baseline", []) is None
+
+
+def test_save_confusion_matrices_writes_one_figure_for_all_epochs(tmp_path):
+    columns = ["true_label", "pred_a", "pred_b", "pred_tie"]
+    confusion_matrices = [
+        (0, columns, [["a", 5, 0, 1], ["b", 0, 4, 2], ["tie", 1, 1, 3]]),
+        (1, columns, [["a", 6, 0, 0], ["b", 0, 5, 1], ["tie", 0, 1, 4]]),
+    ]
+
+    path = save_confusion_matrices(tmp_path, "lstm_baseline", confusion_matrices)
+
+    assert path is not None
+    assert path.name == "confusion_matrix.png"
+    assert path.exists()
+    assert path.stat().st_size > 0
