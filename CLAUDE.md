@@ -164,6 +164,30 @@ external data was added, and is exactly the kind of large-field problem the orig
 could eventually hit too. Raised, not removed (`sys.maxsize`), so a genuinely corrupt file still
 fails loudly rather than reading unboundedly.
 
+**The two HF-backed variants see chat-template-formatted input, not bare concatenated text.**
+`_hf_common.py`'s `make_hf_collate_fn` wraps every example as
+`[{"role": "system", "content": SYSTEM_MESSAGE}, {"role": "user", "content": format_input(ex)}]`
+and tokenizes it through `tokenizer.apply_chat_template(..., add_generation_prompt=True)`, rather
+than calling `tokenizer(format_input(ex))` directly on the raw string. This matters because
+`Qwen/Qwen2.5-*-Instruct` are instruction/chat-tuned models: verified directly against the real
+tokenizer that `<|im_start|>`/`<|im_end|>` are dedicated special tokens (ids 151644/151645,
+outside the 151643-token base vocabulary) both models were SFT-trained to recognize as
+role/turn boundaries, while a hand-picked delimiter like the old bare `[RESPONSE A]` tokenizes
+into 5 meaningless subword fragments the model was never trained to treat specially. `_common.py`'s
+`format_input` itself is untouched and still used as-is by `lstm_baseline.py`, which has no
+chat-template concept — only `_hf_common.py` wraps its output through the chat template.
+`SYSTEM_MESSAGE` overrides the model's generic default ("you are a helpful assistant") with a
+task-specific instruction, since a chat-tuned model's own instruction-following behavior is the
+mechanism that makes it treat "compare these two responses" as the actual task rather than an
+unstructured blob to react to.
+
+Using an instruction-tuned checkpoint as a classifier backbone at all (rather than the base,
+non-instruct model) is deliberate, not an oversight: `AutoModelForSequenceClassification` only
+reuses the transformer backbone's learned representations, replacing the LM head with a fresh
+classification head — reward models in the RLHF literature (InstructGPT, Anthropic's HH-RLHF,
+Llama 2) are routinely initialized from SFT checkpoints for exactly this reason, since a model
+that already represents "what a good answer looks like" transfers well to judging one.
+
 **Best-checkpoint criterion is val_loss, and early stopping is opt-in per config.** `best.pt` is
 saved whenever `val_loss` improves (not `val_accuracy` — a real run's accuracy stayed flat/noisy
 across all 5 epochs while loss moved cleanly, so loss is the metric that shows when a run has

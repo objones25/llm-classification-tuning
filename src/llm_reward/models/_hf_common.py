@@ -27,12 +27,36 @@ class LogitsOnly(nn.Module):
         return self.hf_model(**inputs).logits
 
 
+SYSTEM_MESSAGE = (
+    "You are an expert evaluator comparing two AI responses to the same prompt. "
+    "Determine which response is better, or if they are equally good (a tie)."
+)
+
+
 def make_hf_collate_fn(tokenizer, max_seq_len: int):
     def collate_fn(batch: list[PairwiseExample]) -> dict[str, torch.Tensor]:
         require(len(batch) > 0, "collate_fn received an empty batch")
-        texts = [format_input(ex) for ex in batch]
-        encoded = tokenizer(
-            texts, padding=True, truncation=True, max_length=max_seq_len, return_tensors="pt"
+        # Both HF-backed variants are instruction/chat-tuned models: their learned attention
+        # patterns and representations were shaped through <|im_start|>/<|im_end|>-delimited
+        # message structure, not bare concatenated text. A custom system message (rather than
+        # the model's generic "you are a helpful assistant" default) tells it what task it's
+        # actually being asked to do -- comparing two responses, not chatting.
+        conversations = [
+            [
+                {"role": "system", "content": SYSTEM_MESSAGE},
+                {"role": "user", "content": format_input(ex)},
+            ]
+            for ex in batch
+        ]
+        encoded = tokenizer.apply_chat_template(
+            conversations,
+            tokenize=True,
+            add_generation_prompt=True,
+            padding=True,
+            truncation=True,
+            max_length=max_seq_len,
+            return_tensors="pt",
+            return_dict=True,
         )
         labels = torch.tensor([ex.label for ex in batch], dtype=torch.long)
         return {
