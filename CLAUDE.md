@@ -250,6 +250,19 @@ the LSTM baseline (a plain `nn.Module` with no Hub-native save format) falls bac
 `huggingface_hub.upload_file` with a raw `state_dict`. See
 `docs/superpowers/specs/2026-09-07-training-seams-design.md` (Section E) for the full contract.
 
+**LoRA checkpoints save only adapter + head weights, not the frozen base model.**
+`ModelBundle.state_dict_fn`/`load_state_dict_fn` (in `registry.py`, defaulting to `None` — plain
+`model.state_dict()`/`load_state_dict()`) let a variant override how its checkpoint is
+saved/loaded. `lora_head.py` supplies `get_peft_model_state_dict`/`set_peft_model_state_dict`
+so `Checkpoint.model_state` holds only the trainable adapter + classification head (a few MB),
+not the entire frozen base (tens of GB for a 7B model) that a raw `.state_dict()` call would
+otherwise re-serialize into every `last.pt`/`best.pt`. Always call `registry.model_state_dict`/
+`load_model_state_dict` — never `bundle.model.state_dict()`/`.load_state_dict()` directly — so
+a variant's hook is respected everywhere a checkpoint gets written or read (`train.py`,
+`submit.py`, `push_to_hub.py`). `load_model_state_dict` also accepts a checkpoint saved *before*
+this fix (a full state dict, same key count as `bundle.model.state_dict()`): loading one still
+works, since it's exactly what a plain `load_state_dict()` on the wrapping module expects.
+
 ### Testing (pytest, per the pytest-expert skill — apply its rules directly, don't re-derive them)
 
 - Root `tests/conftest.py`: seeds Python/NumPy/torch RNGs, blocks real network calls by default, and

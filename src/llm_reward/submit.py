@@ -12,7 +12,7 @@ from .data.dataset import PairwiseDataset
 from .data.pairwise import load_test_examples, require_csv_header
 from .models.checkpoint import Checkpoint, ConfigMismatchError
 from .models.config import ConfigError
-from .models.registry import build_model
+from .models.registry import build_model, load_model_state_dict
 from .negative_space import require
 
 SUBMISSION_COLUMNS = ("winner_model_a", "winner_model_b", "winner_tie")
@@ -41,7 +41,7 @@ def generate_submission(
     checkpoint: Checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
 
     bundle = build_model(checkpoint.config)
-    bundle.model.load_state_dict(checkpoint.model_state)
+    load_model_state_dict(bundle, checkpoint.model_state)
     device = torch.accelerator.current_accelerator(check_available=True) or torch.device("cpu")
     bundle.model.to(device)
     bundle.model.eval()

@@ -11,7 +11,7 @@ from transformers import AutoTokenizer, PreTrainedModel
 
 from llm_reward.models.checkpoint import Checkpoint, ConfigMismatchError
 from llm_reward.models.config import ConfigError, LoRAConfig, SFTHeadConfig
-from llm_reward.models.registry import build_model
+from llm_reward.models.registry import build_model, load_model_state_dict
 from llm_reward.negative_space import require
 
 try:
@@ -27,7 +27,7 @@ def _model_card_text(checkpoint: Checkpoint) -> str:
     return (
         f"# {checkpoint.config.run_name}\n\n"
         f"Variant: `{checkpoint.config.variant}`\n\n"
-        f"Best validation accuracy: {checkpoint.best_val_metric:.4f}\n\n"
+        f"Best validation loss: {checkpoint.best_val_metric:.4f}\n\n"
         f"## Training configuration\n\n{config_lines}\n"
     )
 
@@ -38,7 +38,7 @@ def push_to_hub(checkpoint_path: Path, repo_id: str, private: bool = True) -> st
     checkpoint: Checkpoint = torch.load(checkpoint_path, weights_only=False, map_location="cpu")
 
     bundle = build_model(checkpoint.config)
-    bundle.model.load_state_dict(checkpoint.model_state)
+    load_model_state_dict(bundle, checkpoint.model_state)
     real_model = getattr(bundle.model, "hf_model", bundle.model)
 
     api = HfApi()

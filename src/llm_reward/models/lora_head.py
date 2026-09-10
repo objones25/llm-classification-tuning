@@ -1,13 +1,36 @@
 from __future__ import annotations
 
 from peft import LoraConfig as PeftLoraConfig
-from peft import get_peft_model
+from peft import get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
+from torch import nn
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 from ..negative_space import require
 from ._hf_common import LogitsOnly, make_hf_collate_fn
 from .config import LoRAConfig, TrainConfig
 from .registry import ModelBundle, register
+
+
+def _lora_state_dict(model: nn.Module) -> dict:
+    """model is LogitsOnly(peft_model); saves only the LoRA adapter + classification-head
+    weights (a few MB), not the frozen base model (many GB) that bundle.model.state_dict()
+    would otherwise re-serialize into every checkpoint. Verified against a real save/load
+    roundtrip that this reconstructs identical model outputs when the base checkpoint (the
+    same hf_model_name) is unchanged."""
+    return get_peft_model_state_dict(model.hf_model)  # type: ignore[attr-defined]
+
+
+def _load_lora_state_dict(model: nn.Module, state_dict: dict) -> None:
+    peft_model = model.hf_model  # type: ignore[attr-defined]
+    # Backward compatibility: a checkpoint saved before this fix holds `model`'s (the WRAPPING
+    # LogitsOnly's) full state_dict() -- its keys carry the "hf_model." prefix LogitsOnly adds,
+    # and it has exactly as many keys as model.state_dict() itself. set_peft_model_state_dict
+    # expects the smaller, unprefixed adapter-only dict get_peft_model_state_dict produces and
+    # raises KeyError on a full one (verified directly), not a graceful no-op.
+    if len(state_dict) == len(model.state_dict()):
+        model.load_state_dict(state_dict)
+    else:
+        set_peft_model_state_dict(peft_model, state_dict)
 
 
 @register(LoRAConfig.variant)
@@ -69,4 +92,6 @@ def build_model(config: TrainConfig) -> ModelBundle:
         model=LogitsOnly(peft_model),
         collate_fn=make_hf_collate_fn(tokenizer, config.max_seq_len),
         param_groups=param_groups,
+        state_dict_fn=_lora_state_dict,
+        load_state_dict_fn=_load_lora_state_dict,
     )

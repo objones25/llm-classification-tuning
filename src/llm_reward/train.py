@@ -19,7 +19,7 @@ from .data.pairwise import load_pairwise_examples, split_train_val
 from .evaluate import evaluate
 from .models.checkpoint import Checkpoint, ConfigMismatchError
 from .models.config import ConfigError, TrainConfig, load_config
-from .models.registry import ModelBundle, build_model
+from .models.registry import ModelBundle, build_model, load_model_state_dict, model_state_dict
 from .negative_space import require
 
 
@@ -132,7 +132,7 @@ def train(
             raise ConfigMismatchError(
                 f"resume checkpoint at {last_path} was produced by a different config"
             )
-        bundle.model.load_state_dict(checkpoint.model_state)
+        load_model_state_dict(bundle, checkpoint.model_state)
         optimizer.load_state_dict(checkpoint.optimizer_state)
         if checkpoint.scheduler_state is not None:
             scheduler.load_state_dict(checkpoint.scheduler_state)
@@ -259,7 +259,7 @@ def train(
             checkpoint = Checkpoint(
                 epoch=epoch,
                 global_step=global_step,
-                model_state=bundle.model.state_dict(),
+                model_state=model_state_dict(bundle),
                 optimizer_state=optimizer.state_dict(),
                 scheduler_state=scheduler.state_dict(),
                 best_val_metric=best_val_metric,
